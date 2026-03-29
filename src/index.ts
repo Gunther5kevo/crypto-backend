@@ -2,6 +2,10 @@ import express from 'express';
 import dotenv from 'dotenv';
 import { botRouter } from './bot/webhook';
 import { startUserbot } from './userbot/monitor';
+import './queue/queues';
+import './workers/aiEnrichWorker';   
+import './workers/storeWorker';
+import './workers/telegramNotifier'; 
 
 dotenv.config();
 
@@ -17,7 +21,5 @@ app.get('/health', (_req, res) => {
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`[server] Running on port ${PORT}`);
-
-  // Start userbot after server is up
   startUserbot().catch(console.error);
 });

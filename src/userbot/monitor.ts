@@ -2,16 +2,43 @@ import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import { NewMessage } from 'telegram/events';
 import { NormalizedMessage } from '../types/message';
+import { ingestQueue } from '../queue/queues';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-// ── Channels to monitor (add/remove as needed) ──────────────
 const CHANNELS_TO_MONITOR = [
   'https://t.me/trading',
   'https://t.me/Spoilersignalsnews',
-  // Add more external channel usernames here
+  'https://t.me/+Va4L5HF7dtdmOWE0',
+  'https://t.me/just',
+  'https://t.me/Tensor_news',
 ];
+
+// ── Layer 1: In-memory deduplication ────────────────────────
+const recentHashes = new Set<string>();
+
+function isDuplicate(text: string): boolean {
+  const hash = text.slice(0, 100).toLowerCase().replace(/\s+/g, '');
+  if (recentHashes.has(hash)) return true;
+  recentHashes.add(hash);
+  if (recentHashes.size > 500) recentHashes.clear();
+  return false;
+}
+
+function isSpam(text: string): boolean {
+  const spamKeywords = [
+    // Adult content
+    'bedroom', 'tape', 'couples', 'naked', 'xxx',
+    'onlyfans', 'escort', 'adult', 'sweaty', 'nude',
+    'hardcore', 'cam', 'curvy', 'riding', '4k girls',
+    // Spam patterns
+    'click here', 'earn $', 'make money fast',
+    'dm me', 'inbox me', 'whatsapp me',
+  ];
+  const lower = text.toLowerCase();
+  return spamKeywords.some(keyword => lower.includes(keyword));
+}
 
 function extractUrls(text: string): string[] {
   const urlRegex = /(https?:\/\/[^\s]+)/g;
@@ -41,7 +68,6 @@ export async function startUserbot(): Promise<void> {
   await client.connect();
   console.log('[userbot] ✅ Connected to Telegram');
 
-  // Listen to new messages from monitored channels only
   client.addEventHandler(async (event) => {
     const message = event.message;
     if (!message?.text) return;
@@ -50,12 +76,23 @@ export async function startUserbot(): Promise<void> {
     const chatUsername = (chat as any)?.username || '';
     const chatTitle = (chat as any)?.title || chatUsername || 'unknown';
 
-    // Only process messages from channels we're monitoring
+    // Only process monitored channels
     const isMonitored = CHANNELS_TO_MONITOR.some(c =>
       c.includes(chatUsername)
     );
-
     if (!isMonitored) return;
+
+    // Spam filter
+    if (isSpam(message.text)) {
+      console.log('[userbot] 🚫 Spam filtered:', message.text.slice(0, 50));
+      return;
+    }
+
+    // Duplicate filter
+    if (isDuplicate(message.text)) {
+      console.log('[userbot] ⚠️ Duplicate skipped:', message.text.slice(0, 50));
+      return;
+    }
 
     const normalized: NormalizedMessage = {
       source: 'userbot',
@@ -67,14 +104,9 @@ export async function startUserbot(): Promise<void> {
       raw: message,
     };
 
-    console.log('[userbot] ✅ Message received:', {
-      author: normalized.author,
-      preview: normalized.text.slice(0, 80),
-      urls: normalized.urls.length,
-      hashtags: normalized.hashtags,
-    });
-
-    // TODO: push to queue (Step 4)
+    // Push to ingest queue
+    await ingestQueue.add('userbot_message', normalized);
+    console.log('[userbot] ✅ Queued:', normalized.author, '→', normalized.text.slice(0, 60));
 
   }, new NewMessage({}));
 

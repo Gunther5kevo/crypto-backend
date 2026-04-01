@@ -39,6 +39,25 @@ function buildReferralLinks(urls: string[]): ReferralLink[] {
   });
 }
 
+// ── Tag builder ──────────────────────────────────────────────
+// Priority: AI tags → message hashtags → fallback
+function buildTags(
+  aiTags: string[] | undefined,
+  hashtags: string[],
+  category: string,
+  author: string
+): string[] {
+  if (aiTags && aiTags.length >= 3) return aiTags;
+  if (hashtags.length >= 3) return hashtags;
+  return [
+    category,
+    author.toLowerCase().replace(/\s+/g, '-'),
+    'crypto',
+    'kenya',
+    'africa',
+  ];
+}
+
 // ── SEO Quality Gate ─────────────────────────────────────────
 interface QualityResult {
   passes: boolean;
@@ -87,7 +106,7 @@ function checkQuality(post: Post): QualityResult {
     reasons.push(`Focus keyword "${keyword}" not in title`);
   }
 
-  // ── Keyword density in content 0.5-3% (15 points) ────────
+  // ── Keyword density 0.5-3% (15 points) ───────────────────
   if (keyword && plainText) {
     const kwMatches = (plainText.toLowerCase().match(
       new RegExp(keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')
@@ -147,7 +166,7 @@ STRICT SEO REQUIREMENTS:
 - meta_title: must contain focus_keyword, count characters carefully — must be BETWEEN 50 AND 60 chars
 - meta_description: must contain focus_keyword, count characters carefully — must be BETWEEN 120 AND 160 chars
 - Use the focus_keyword at least 6 times naturally in the content
-- tags: exactly 5 specific crypto tags
+- tags: exactly 5 specific crypto tags e.g ["bitcoin", "crypto-news", "kenya", "africa", "trading"]
 
 RESPOND WITH VALID JSON ONLY. No markdown, no backticks, no extra text:
 {
@@ -162,6 +181,17 @@ RESPOND WITH VALID JSON ONLY. No markdown, no backticks, no extra text:
 `.trim();
 }
 
+// ── Publishing decision ───────────────────────────────────────
+function shouldPublish(source: string, score: number): boolean {
+  if (source === 'bot') {
+    // Your own channel — publish if score ≥ 70
+    return score >= 70;
+  } else {
+    // External verified channels — publish if score ≥ 75
+    return score >= 75;
+  }
+}
+
 // ── Main worker ──────────────────────────────────────────────
 export const aiEnrichWorker = new Worker(
   'ingest_message',
@@ -169,7 +199,7 @@ export const aiEnrichWorker = new Worker(
     const msg: NormalizedMessage = job.data;
     const category = classifyCategory(msg.text);
 
-    console.log(`[aiWorker] 🤖 Enriching message from ${msg.author}...`);
+    console.log(`[aiWorker] 🤖 Enriching message from ${msg.author} (source: ${msg.source})...`);
 
     let post: Post;
 
@@ -187,7 +217,7 @@ export const aiEnrichWorker = new Worker(
           },
         ],
         temperature: 0.7,
-        max_tokens: 4000, // increased to allow full 600+ word posts
+        max_tokens: 4000,
       });
 
       const raw = response.choices[0].message.content || '';
@@ -200,7 +230,7 @@ export const aiEnrichWorker = new Worker(
         content:          generated.content,
         excerpt:          generated.excerpt,
         author:           msg.author,
-        tags:             generated.tags || [category],
+        tags:             buildTags(generated.tags, msg.hashtags, category, msg.author),
         category,
         referral_links:   buildReferralLinks(msg.urls),
         is_published:     false,
@@ -219,7 +249,7 @@ export const aiEnrichWorker = new Worker(
       });
 
     } catch (err) {
-      // ── Fallback if AI fails ───────────────────────────────
+      // ── Fallback if AI fails ─────────────────────────────
       console.error('[aiWorker] ⚠️ AI failed, using fallback:', err);
       const title = msg.text.split(/[.\n]/)[0].slice(0, 80);
       post = {
@@ -228,7 +258,7 @@ export const aiEnrichWorker = new Worker(
         content:          `<p>${msg.text}</p>`,
         excerpt:          msg.text.slice(0, 200),
         author:           msg.author,
-        tags:             msg.hashtags.length ? msg.hashtags : [category],
+        tags:             buildTags(undefined, msg.hashtags, category, msg.author),
         category,
         referral_links:   buildReferralLinks(msg.urls),
         is_published:     false,
@@ -238,12 +268,17 @@ export const aiEnrichWorker = new Worker(
       };
     }
 
-    // ── Quality gate ─────────────────────────────────────────
+    // ── Quality gate + publishing decision ───────────────────
     const quality = checkQuality(post);
-    post.is_published = quality.passes;
+    const publish = shouldPublish(msg.source, quality.score);
+    post.is_published = publish;
 
-    console.log(`[aiWorker] 📊 Quality score: ${quality.score}/100 — ${quality.passes ? '✅ Auto-publishing' : '📝 Saving as draft'}`);
-    if (!quality.passes) {
+    const sourceLabel = msg.source === 'bot' ? 'bot (threshold: 70)' : 'userbot (threshold: 75)';
+    const publishLabel = publish ? '✅ Auto-publishing' : '📝 Saving as draft';
+
+    console.log(`[aiWorker] 📊 Quality score: ${quality.score}/100 | Source: ${sourceLabel} | ${publishLabel}`);
+
+    if (!publish) {
       console.log(`[aiWorker] ⚠️ Quality issues:`, quality.reasons);
     }
 

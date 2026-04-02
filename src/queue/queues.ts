@@ -9,35 +9,34 @@ export const redisConnection = new IORedis(process.env.REDIS_URL || 'redis://loc
 redisConnection.on('connect', () => console.log('[redis] ✅ Connected'));
 redisConnection.on('error', (err) => console.error('[redis] ❌ Error:', err));
 
+const defaultJobOptions = {
+  attempts: 3,
+  backoff: { type: 'exponential', delay: 2000 },
+  removeOnComplete: true,
+  removeOnFail: false,
+};
+
 // ── Queues ───────────────────────────────────────────────────
 export const ingestQueue = new Queue('ingest_message', {
   connection: redisConnection,
-  defaultJobOptions: {
-    attempts: 3,                  // retry failed jobs 3 times
-    backoff: { type: 'exponential', delay: 2000 },
-    removeOnComplete: true,       // clean up completed jobs
-    removeOnFail: false,          // keep failed jobs for debugging
-  },
+  defaultJobOptions,
 });
 
 export const processQueue = new Queue('process_content', {
   connection: redisConnection,
-  defaultJobOptions: {
-    attempts: 3,
-    backoff: { type: 'exponential', delay: 2000 },
-    removeOnComplete: true,
-    removeOnFail: false,
-  },
+  defaultJobOptions,
 });
 
+// Published posts → stored to DB + Telegram notification sent
 export const storeQueue = new Queue('store_post', {
   connection: redisConnection,
-  defaultJobOptions: {
-    attempts: 3,
-    backoff: { type: 'exponential', delay: 2000 },
-    removeOnComplete: true,
-    removeOnFail: false,
-  },
+  defaultJobOptions,
+});
+
+// Draft posts → stored to DB only, no Telegram notification
+export const draftQueue = new Queue('draft_post', {
+  connection: redisConnection,
+  defaultJobOptions,
 });
 
 console.log('[queue] ✅ Queues initialized');

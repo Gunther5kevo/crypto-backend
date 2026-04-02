@@ -23,46 +23,45 @@ async function sendToChannel(text: string): Promise<void> {
 
 // Extract 2-3 key bullet points from HTML content
 function extractKeyPoints(content: string): string[] {
-  // Strip HTML tags and get plain text
   const plain = content.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-
-  // Split into sentences
-  const sentences = plain
+  return plain
     .split(/(?<=[.!?])\s+/)
     .filter(s => s.length > 40 && s.length < 180)
-    .filter(s => !s.toLowerCase().includes('disclaimer'));
-
-  // Return first 3 meaningful sentences as bullet points
-  return sentences.slice(0, 3);
+    .filter(s => !s.toLowerCase().includes('disclaimer'))
+    .slice(0, 3);
 }
 
+// This worker ONLY listens to store_post — the queue that only receives
+// published posts. Drafts are routed to draft_post in the AI worker,
+// so they never reach here and never trigger a Telegram notification.
 export const telegramNotifier = new Worker(
   'store_post',
   async (job: Job) => {
     const post: Post = job.data;
 
-    // Only notify for published posts
+    // Secondary guard — defensive check in case queue routing ever changes
     if (!post.is_published) {
-      console.log(`[notifier] ⏭️ Skipping draft: "${post.title}"`);
+      console.warn(
+        `[notifier] ⚠️ Draft reached store_post queue unexpectedly — skipping: "${post.title}"`,
+      );
       return;
     }
 
     const siteUrl = (process.env.SITE_URL || 'https://cryptomonieid.com').replace(/\/$/, '');
     const postUrl = `${siteUrl}/blog/${post.slug}`;
 
-    const emoji = post.category === 'airdrop' ? '🪂'
-                : post.category === 'signal'  ? '📊'
-                : '📰';
+    const emoji =
+      post.category === 'airdrop' ? '🪂' :
+      post.category === 'signal'  ? '📊' :
+      '📰';
 
-    const categoryLabel = post.category === 'airdrop' ? 'Airdrop Alert'
-                        : post.category === 'signal'  ? 'Trading Signal'
-                        : 'Crypto News';
+    const categoryLabel =
+      post.category === 'airdrop' ? 'Airdrop Alert' :
+      post.category === 'signal'  ? 'Trading Signal' :
+      'Crypto News';
 
-    // Extract key points from content
     const keyPoints = extractKeyPoints(post.content || '');
     const bulletPoints = keyPoints.map(p => `• ${p}`).join('\n');
-
-    // Tags formatted as hashtags
     const hashtags = post.tags?.map(t => `#${t.replace(/\s+/g, '')}`).join(' ') || '';
 
     const message = [
@@ -82,9 +81,9 @@ export const telegramNotifier = new Worker(
     ].join('\n');
 
     await sendToChannel(message);
-    console.log(`[notifier] ✅ Posted to Telegram channel: ${post.title}`);
+    console.log(`[notifier] ✅ Posted to Telegram channel: "${post.title}"`);
   },
-  { connection: redisConnection }
+  { connection: redisConnection },
 );
 
 telegramNotifier.on('completed', job => {

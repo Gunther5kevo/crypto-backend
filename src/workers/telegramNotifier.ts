@@ -5,7 +5,9 @@ import { Post } from '../supabase/client';
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
 const NOTIFY_CHANNEL = process.env.TELEGRAM_NOTIFY_CHANNEL!;
 
-async function sendToChannel(text: string): Promise<void> {
+// Exported so aiEnrichWorker can send quick Telegram-only alerts
+// for price tickers and low-value messages that don't warrant a full post.
+export async function sendToChannel(text: string): Promise<void> {
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
   const res = await fetch(url, {
     method: 'POST',

@@ -3,20 +3,110 @@ import OpenAI from 'openai';
 import { redisConnection, storeQueue, draftQueue } from '../queue/queues';
 import { NormalizedMessage } from '../types/message';
 import { Post, ReferralLink } from '../supabase/client';
+import { supabase } from '../supabase/client';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ── Category classifier ──────────────────────────────────────
+// ── Blog-worthiness filter ────────────────────────────────────
+// Returns false for messages that should only go to Telegram,
+// not become full blog posts.
+function shouldBlog(text: string): boolean {
+  const lower = text.toLowerCase().trim();
+
+  // Too short to be a meaningful article
+  if (text.split(/\s+/).length < 20) return false;
+
+  // Pure price-ticker patterns: "BTC: $98,500 ▲2.3%" style messages
+  // These are useful as Telegram alerts but not as blog content
+  const priceTicker = /^[a-z\s/]+:\s*\$[\d,]+(\.\d+)?\s*[▲▼]?\s*[\d.]+%/i;
+  if (priceTicker.test(lower)) return false;
+
+  // Messages that are mostly just a price table / list of coins + prices
+  const lines = text.split('\n').filter(l => l.trim());
+  const priceLines = lines.filter(l => /\$[\d,]+(\.\d+)?/.test(l));
+  if (lines.length > 2 && priceLines.length / lines.length > 0.6) return false;
+
+  // Common low-value patterns that don't deserve a full post
+  const lowValuePatterns = [
+    /^(bitcoin|btc|eth|ethereum|crypto)\s+(is\s+)?(now\s+)?(trading|at|up|down)\s+/i,
+    /^(market\s+)?(update|recap|summary)\s*:/i,         // bare "Market Update: BTC $98k"
+    /^\d+[\d\s.,]+$/, // pure numbers
+  ];
+  if (lowValuePatterns.some(p => p.test(lower))) return false;
+
+  return true;
+}
+
+// ── Deduplication ────────────────────────────────────────────
+// Check if a near-identical post was already stored in the last 24h.
+// Uses a simple keyword overlap approach — no embeddings needed.
+async function isDuplicate(text: string, title: string): Promise<boolean> {
+  try {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    const { data: recentPosts, error } = await supabase
+      .from('posts')
+      .select('title, excerpt')
+      .gte('created_at', since)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (error || !recentPosts?.length) return false;
+
+    // Extract meaningful keywords from the incoming text (ignore stop words)
+    const stopWords = new Set([
+      'the','a','an','and','or','but','in','on','at','to','for','of','with',
+      'is','are','was','were','be','been','has','have','had','will','would',
+      'that','this','it','as','by','from','its','their','they','about','after',
+      'bitcoin','crypto','blockchain', // too common to be discriminating
+    ]);
+
+    const keywords = (text + ' ' + title)
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length > 3 && !stopWords.has(w));
+
+    if (!keywords.length) return false;
+
+    for (const post of recentPosts) {
+      const existing = `${post.title} ${post.excerpt}`.toLowerCase();
+      const matchCount = keywords.filter(kw => existing.includes(kw)).length;
+      const overlap = matchCount / keywords.length;
+
+      // >60% keyword overlap = likely the same story
+      if (overlap > 0.6) {
+        console.log(`[aiWorker] 🔁 Duplicate detected (${Math.round(overlap * 100)}% overlap) with: "${post.title}"`);
+        return true;
+      }
+    }
+
+    return false;
+  } catch (err) {
+    // If the check fails, allow the post through — better a duplicate than a gap
+    console.warn('[aiWorker] ⚠️ Dedup check failed, allowing post:', err);
+    return false;
+  }
+}
+
+// ── Category classifier ───────────────────────────────────────
 function classifyCategory(text: string): string {
   const lower = text.toLowerCase();
-  if (lower.includes('airdrop') || lower.includes('claim') || lower.includes('free token'))
-    return 'airdrop';
+
   if (
-    lower.includes('signal') || lower.includes('buy') || lower.includes('sell') ||
-    lower.includes('long') || lower.includes('short') || lower.includes('entry') ||
-    lower.includes('tp') || lower.includes('sl')
-  )
-    return 'signal';
+    lower.includes('airdrop') ||
+    lower.includes('claim now') ||
+    lower.includes('free token') ||
+    lower.includes('whitelist')
+  ) return 'airdrop';
+
+  const signalTerms = [
+    'entry', 'take profit', 'stop loss', 'tp:', 'sl:', 'long ', 'short ',
+    'leverage', 'futures', 'target:', 'invalidation', 'risk/reward',
+  ];
+  const signalCount = signalTerms.filter(t => lower.includes(t)).length;
+  if (signalCount >= 2) return 'signal';
+
   return 'news';
 }
 
@@ -61,7 +151,6 @@ interface CoinData {
   volume24h: number;
 }
 
-// Detect which coins are mentioned in the text
 function detectCoins(text: string): string[] {
   const knownCoins: Record<string, string> = {
     bitcoin: 'bitcoin', btc: 'bitcoin',
@@ -79,15 +168,11 @@ function detectCoins(text: string): string[] {
 
   const lower = text.toLowerCase();
   const found = new Set<string>();
-
   for (const [keyword, coinId] of Object.entries(knownCoins)) {
     if (lower.includes(keyword)) found.add(coinId);
   }
-
-  // Always include bitcoin as baseline market context
   found.add('bitcoin');
-
-  return [...found].slice(0, 4); // cap at 4 to keep prompt manageable
+  return [...found].slice(0, 4);
 }
 
 async function fetchCoinData(coinIds: string[]): Promise<CoinData[]> {
@@ -98,9 +183,7 @@ async function fetchCoinData(coinIds: string[]): Promise<CoinData[]> {
       headers: { Accept: 'application/json' },
       signal: AbortSignal.timeout(5000),
     });
-
     if (!res.ok) throw new Error(`CoinGecko ${res.status}`);
-
     const data = await res.json();
     return data.map((c: any) => ({
       symbol:    c.symbol.toUpperCase(),
@@ -117,7 +200,6 @@ async function fetchCoinData(coinIds: string[]): Promise<CoinData[]> {
 
 function formatCoinContext(coins: CoinData[]): string {
   if (!coins.length) return 'Market data unavailable at time of writing.';
-
   return coins
     .map(c => {
       const direction = c.change24h >= 0 ? '▲' : '▼';
@@ -145,9 +227,10 @@ function checkQuality(post: Post): QualityResult {
   const plainText = post.content?.replace(/<[^>]+>/g, '') || '';
   const wordCount = plainText.split(/\s+/).filter(Boolean).length;
   const sentences = plainText.split(/[.!?]+/).filter(s => s.trim().length > 10);
-  const keyword = post.focus_keyword?.toLowerCase() || '';
 
-  // ── Word count (20 points) ───────────────────────────────
+  const rawKeyword  = post.focus_keyword?.toLowerCase().trim() || '';
+  const rootKeyword = rawKeyword.split(/\s+/)[0];
+
   if (wordCount >= 600) {
     score += 20;
   } else if (wordCount >= 400) {
@@ -157,8 +240,6 @@ function checkQuality(post: Post): QualityResult {
     reasons.push(`Word count too short (${wordCount}/400 minimum)`);
   }
 
-  // ── Sentence variety (10 points) ─────────────────────────
-  // Flags AI padding: posts where >60% of sentences are under 12 words
   if (sentences.length > 0) {
     const shortSentences = sentences.filter(
       s => s.trim().split(/\s+/).length < 12
@@ -167,12 +248,10 @@ function checkQuality(post: Post): QualityResult {
     if (shortRatio < 0.6) {
       score += 10;
     } else {
-      reasons.push(`Too many short sentences (${Math.round(shortRatio * 100)}% under 12 words — likely AI padding)`);
+      reasons.push(`Too many short sentences (${Math.round(shortRatio * 100)}% under 12 words)`);
     }
   }
 
-  // ── Contains live market data (10 points) ─────────────────
-  // Checks for price patterns like $45,230 or $0.0023
   const hasPriceData = /\$[\d,]+(\.\d+)?/.test(plainText);
   if (hasPriceData) {
     score += 10;
@@ -180,7 +259,6 @@ function checkQuality(post: Post): QualityResult {
     reasons.push('No live price data found in content');
   }
 
-  // ── Meta title length 50-60 chars (10 points) ────────────
   const metaTitleLen = post.meta_title?.length || 0;
   if (metaTitleLen >= 50 && metaTitleLen <= 60) {
     score += 10;
@@ -188,7 +266,6 @@ function checkQuality(post: Post): QualityResult {
     reasons.push(`Meta title length off (${metaTitleLen} chars, need 50-60)`);
   }
 
-  // ── Meta description length 120-160 chars (10 points) ────
   const metaDescLen = post.meta_description?.length || 0;
   if (metaDescLen >= 120 && metaDescLen <= 160) {
     score += 10;
@@ -196,45 +273,37 @@ function checkQuality(post: Post): QualityResult {
     reasons.push(`Meta description length off (${metaDescLen} chars, need 120-160)`);
   }
 
-  // ── Focus keyword in title (10 points) ───────────────────
-  if (keyword && post.title?.toLowerCase().includes(keyword)) {
+  if (rootKeyword && post.title?.toLowerCase().includes(rootKeyword)) {
     score += 10;
   } else {
-    reasons.push(`Focus keyword "${keyword}" missing from title`);
+    reasons.push(`Focus keyword root "${rootKeyword}" missing from title`);
   }
 
-  // ── Keyword density 0.5-2.5% (10 points) ─────────────────
-  if (keyword && plainText) {
-    const kwMatches = (
-      plainText.toLowerCase().match(
-        new RegExp(keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
-      ) || []
-    ).length;
+  if (rootKeyword && plainText) {
+    const escaped = rootKeyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const kwMatches = (plainText.toLowerCase().match(new RegExp(escaped, 'g')) || []).length;
     const density = (kwMatches / wordCount) * 100;
     if (density >= 0.5 && density <= 2.5) {
       score += 10;
     } else {
-      reasons.push(`Keyword density off (${density.toFixed(1)}% — aim 0.5-2.5%)`);
+      reasons.push(`Keyword density off (${density.toFixed(1)}% for "${rootKeyword}" — aim 0.5-2.5%)`);
     }
   }
 
-  // ── H2 headings present (5 points) ───────────────────────
-  const h2Count = (post.content?.match(/<h2>/g) || []).length;
+  const h2Count = (post.content?.match(/<h2>/gi) || []).length;
   if (h2Count >= 3) {
     score += 5;
   } else {
     reasons.push(`Not enough H2 headings (${h2Count}/3)`);
   }
 
-  // ── Sufficient tags (5 points) ───────────────────────────
   if (post.tags && post.tags.length >= 3) {
     score += 5;
   } else {
     reasons.push('Not enough tags (need 3+)');
   }
 
-  const passes = score >= 70;
-  return { passes, score, reasons };
+  return { passes: score >= 70, score, reasons };
 }
 
 // ── AI Prompt ────────────────────────────────────────────────
@@ -244,7 +313,7 @@ function buildPrompt(
   coinContext: string,
 ): string {
   return `
-You are a professional crypto journalist writing an original, insight-driven blog post.
+You are a professional crypto journalist writing an original, insight-driven blog post for a crypto education platform.
 
 SOURCE MESSAGE:
 "${msg.text}"
@@ -254,42 +323,65 @@ CATEGORY: ${category}
 URLS FOUND: ${msg.urls.join(', ') || 'none'}
 HASHTAGS: ${msg.hashtags.join(', ') || 'none'}
 
-LIVE MARKET DATA (use these exact figures in your content — this is what makes the post original):
+LIVE MARKET DATA (embed these exact figures in your content — this is what makes the post original and not generic):
 ${coinContext}
 
-STRICT CONTENT REQUIREMENTS:
-- Minimum 650 words of actual readable text — count carefully
-- You MUST reference the live market data above with specific prices and percentages
-- Each H2 section needs at least 2 full paragraphs (not padding — real analysis)
-- Use proper HTML: <h2>, <p>, <ul>, <li> tags only
-- Include exactly 5 H2 sections:
-    1. What happened (the event/signal/news)
-    2. Market context (use the live price data here)
-    3. What the data suggests (your analysis — take a position)
-    4. What traders and investors should watch
-    5. Key takeaways
-- Vary your sentence length — mix short punchy sentences with longer analytical ones
-- Do NOT use filler phrases like "this could have significant implications" or "it remains to be seen"
-- Take a clear analytical stance — agree or disagree with the signal, explain why
+═══════════════════════════════════════
+CONTENT REQUIREMENTS — READ CAREFULLY
+═══════════════════════════════════════
+
+WORD COUNT: You MUST write at least 700 words of readable text (excluding HTML tags).
+Count as you write. If you are under 700 words, keep writing until you reach it.
+Short posts will be rejected.
+
+STRUCTURE: Use exactly 5 H2 sections:
+  1. What Happened
+  2. Market Context (embed the live price data here — use the exact figures provided)
+  3. What the Data Tells Us (take a clear analytical position — do not hedge)
+  4. What to Watch Next
+  5. Key Takeaways
+
+WRITING RULES:
+- Each H2 section must have at least 3 full paragraphs
+- Mix sentence lengths: short punchy sentences AND longer analytical ones
+- Embed specific prices and percentages from the live market data above
+- Take a clear stance — agree or disagree with the signal, explain why
+- Do NOT use filler: "this could have significant implications", "it remains to be seen", "time will tell"
+- Tone: sharp, informed, direct — Bloomberg crypto desk style
 - End with: <p><em>Disclaimer: This content is for informational purposes only and does not constitute financial advice.</em></p>
-- Tone: sharp, informed, direct — like a Bloomberg crypto desk piece
+- HTML tags allowed: <h2>, <p>, <ul>, <li>, <strong>, <em> only
 
-STRICT SEO REQUIREMENTS:
-- focus_keyword: maximum 3 words (e.g. "Bitcoin price drop"). Never a full sentence.
-- title: must contain the focus_keyword exactly, 60-80 total characters
-- meta_title: must contain focus_keyword, BETWEEN 50 AND 60 chars exactly
-- meta_description: must contain focus_keyword, BETWEEN 120 AND 160 chars exactly
-- Use the focus_keyword 5-7 times naturally — never forced
-- tags: exactly 5 specific crypto tags e.g. ["bitcoin", "crypto-news", "defi", "trading", "blockchain"]
+═══════════════════════════════════════
+SEO REQUIREMENTS — EXACT CONSTRAINTS
+═══════════════════════════════════════
 
-RESPOND WITH VALID JSON ONLY. No markdown, no backticks, no extra text:
+focus_keyword: 1 to 2 words MAXIMUM (e.g. "Bitcoin", "crypto regulation", "Ethereum ETF")
+  — NEVER a 3-word phrase, NEVER a full sentence
+  — The focus_keyword MUST appear in the title verbatim
+
+title: Must contain the focus_keyword verbatim. 60-80 total characters.
+
+meta_title: Must contain focus_keyword. EXACTLY 50-60 characters. Count them.
+
+meta_description: Must contain focus_keyword. EXACTLY 120-160 characters. Count them.
+
+Use the focus_keyword 5-8 times naturally throughout the content body.
+
+tags: exactly 5 lowercase hyphenated tags relevant to the post topic.
+
+═══════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════
+
+Respond with VALID JSON ONLY. No markdown fences, no backticks, no commentary before or after.
+
 {
-  "title": "60-80 char title with focus keyword",
-  "content": "<h2>...</h2><p>...</p>... minimum 650 words with live price data woven in",
-  "excerpt": "150-200 char summary with focus keyword and a specific data point",
-  "meta_title": "50-60 chars exactly with focus keyword",
-  "meta_description": "120-160 chars exactly with focus keyword",
-  "focus_keyword": "max 3 words",
+  "title": "60-80 chars, contains focus_keyword verbatim",
+  "content": "<h2>What Happened</h2><p>...</p>... 700+ words with live prices embedded",
+  "excerpt": "150-200 char summary mentioning focus_keyword and one specific data point",
+  "meta_title": "exactly 50-60 chars, contains focus_keyword",
+  "meta_description": "exactly 120-160 chars, contains focus_keyword",
+  "focus_keyword": "1-2 words maximum",
   "tags": ["tag1", "tag2", "tag3", "tag4", "tag5"]
 }
 `.trim();
@@ -297,7 +389,6 @@ RESPOND WITH VALID JSON ONLY. No markdown, no backticks, no extra text:
 
 // ── Publishing decision ───────────────────────────────────────
 function shouldPublish(source: string, score: number): boolean {
-  // Own channel: publish at 70+, external: 75+
   return source === 'bot' ? score >= 70 : score >= 75;
 }
 
@@ -306,13 +397,31 @@ export const aiEnrichWorker = new Worker(
   'ingest_message',
   async (job: Job) => {
     const msg: NormalizedMessage = job.data;
-    const category = classifyCategory(msg.text);
 
+    // ── Step 1: Blog-worthiness filter ───────────────────────
+    // Price tickers and very short messages go straight to Telegram,
+    // they don't need a full blog post written about them.
+    if (!shouldBlog(msg.text)) {
+      console.log(`[aiWorker] ⚡ Skipping blog — low-value/price-ticker message from ${msg.author}. Routing to Telegram only.`);
+
+      const { sendToChannel } = await import('../workers/telegramNotifier');
+      const preview = msg.text.length > 300 ? msg.text.slice(0, 300) + '…' : msg.text;
+      await sendToChannel(`⚡ <b>Quick Update</b>\n\n${preview}`);
+      return;
+    }
+
+    // ── Step 2: Deduplication check ──────────────────────────
+    const duplicate = await isDuplicate(msg.text, msg.text.split(/[.\n]/)[0].slice(0, 80));
+    if (duplicate) {
+      console.log(`[aiWorker] 🔁 Skipping duplicate story from ${msg.author}`);
+      return;
+    }
+
+    const category = classifyCategory(msg.text);
     console.log(`[aiWorker] 🤖 Enriching message from ${msg.author} (source: ${msg.source})...`);
 
-    // ── Fetch live market data before building the prompt ────
-    const coinIds = detectCoins(msg.text);
-    const coinData = await fetchCoinData(coinIds);
+    const coinIds     = detectCoins(msg.text);
+    const coinData    = await fetchCoinData(coinIds);
     const coinContext = formatCoinContext(coinData);
     console.log(`[aiWorker] 📈 Market context fetched for: ${coinIds.join(', ')}`);
 
@@ -325,7 +434,9 @@ export const aiEnrichWorker = new Worker(
           {
             role: 'system',
             content:
-              'You are a professional crypto journalist. You write original, data-driven posts of at least 650 words. You always embed live market data into your analysis. You always respond with valid JSON only.',
+              'You are a professional crypto journalist. You write original, data-driven posts of at least 700 words. ' +
+              'You always embed live market data into your analysis. ' +
+              'You always respond with valid JSON only — no markdown, no backticks, no extra text.',
           },
           {
             role: 'user',
@@ -333,11 +444,11 @@ export const aiEnrichWorker = new Worker(
           },
         ],
         temperature: 0.65,
-        max_tokens: 4000,
+        max_tokens: 6000,
       });
 
-      const raw = response.choices[0].message.content || '';
-      const clean = raw.replace(/```json|```/g, '').trim();
+      const raw       = response.choices[0].message.content || '';
+      const clean     = raw.replace(/```json|```/g, '').trim();
       const generated = JSON.parse(clean);
 
       post = {
@@ -355,17 +466,20 @@ export const aiEnrichWorker = new Worker(
         focus_keyword:    generated.focus_keyword,
       };
 
+      const wordCount = post.content?.replace(/<[^>]+>/g, '').split(/\s+/).filter(Boolean).length ?? 0;
+
       console.log('[aiWorker] ✅ AI generated post:', {
-        title:         post.title,
-        slug:          post.slug,
-        category:      post.category,
-        tags:          post.tags,
-        focus_keyword: post.focus_keyword,
-        word_count:    post.content?.replace(/<[^>]+>/g, '').split(/\s+/).filter(Boolean).length,
-        has_price_data: /\$[\d,]+(\.\d+)?/.test(post.content || ''),
+        title:            post.title,
+        slug:             post.slug,
+        category:         post.category,
+        tags:             post.tags,
+        focus_keyword:    post.focus_keyword,
+        word_count:       wordCount,
+        meta_title_len:   post.meta_title?.length,
+        meta_desc_len:    post.meta_description?.length,
+        has_price_data:   /\$[\d,]+(\.\d+)?/.test(post.content || ''),
       });
     } catch (err) {
-      // ── Fallback if AI fails ─────────────────────────────
       console.error('[aiWorker] ⚠️ AI failed, using fallback:', err);
       const title = msg.text.split(/[.\n]/)[0].slice(0, 80);
       post = {
@@ -384,13 +498,13 @@ export const aiEnrichWorker = new Worker(
       };
     }
 
-    // ── Quality gate + publishing decision ───────────────────
+    // ── Step 3: Quality gate + publishing decision ────────────
     const quality = checkQuality(post);
     const publish = shouldPublish(msg.source, quality.score);
     post.is_published = publish;
 
-    const sourceLabel = msg.source === 'bot' ? 'bot (threshold: 70)' : 'userbot (threshold: 75)';
-    const publishLabel = publish ? '✅ Auto-publishing' : '📝 Saving as draft (no Telegram notify)';
+    const sourceLabel  = msg.source === 'bot' ? 'bot (threshold: 70)' : 'userbot (threshold: 75)';
+    const publishLabel = publish ? '✅ Auto-publishing' : '📝 Saving as draft';
 
     console.log(
       `[aiWorker] 📊 Quality score: ${quality.score}/100 | Source: ${sourceLabel} | ${publishLabel}`,
@@ -400,9 +514,6 @@ export const aiEnrichWorker = new Worker(
       console.log('[aiWorker] ⚠️ Quality issues:', quality.reasons);
     }
 
-    // ── Route to correct queue ────────────────────────────────
-    // Drafts go to draft_post queue — notifier only listens to store_post
-    // so drafts will never trigger a Telegram notification
     if (publish) {
       await storeQueue.add('store_post', post);
       console.log(`[aiWorker] 📤 Pushed to store queue (will notify): ${post.slug}`);

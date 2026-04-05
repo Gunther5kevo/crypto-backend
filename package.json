@@ -16,12 +16,17 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.100.1",
     "bullmq": "^5.71.1",
+    "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "input": "^1.0.1",
     "ioredis": "^5.10.1",
     "nodemon": "^3.1.14",
     "openai": "^6.33.0",
+    "resend": "^6.10.0",
     "telegram": "^2.26.22"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19"
   }
 }

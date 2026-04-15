@@ -111,16 +111,39 @@ function classifyCategory(text: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────
-// SECTION 4 — SLUG GENERATOR
-// Strips AI-flavoured filler words that pollute slugs.
+// SECTION 3b — AFRICAN CONTEXT DETECTOR
+// Only inject African/Kenyan framing when the story is
+// genuinely relevant to that market — not on every article.
 // ─────────────────────────────────────────────────────────────
+const AFRICA_RELEVANT_TERMS = [
+  // Geography
+  'africa', 'african', 'kenya', 'kenyan', 'nigeria', 'nigerian', 'ghana', 'ghanaian',
+  'south africa', 'ethiopia', 'tanzania', 'uganda', 'rwanda', 'egypt',
+  'nairobi', 'lagos', 'accra', 'johannesburg', 'cairo',
+  // Finance / infra that maps to African context
+  'm-pesa', 'mpesa', 'mobile money', 'remittance', 'unbanked',
+  'local exchange', 'binance p2p', 'yellow card', 'bitpesa', 'paxful',
+  // Macro signals that genuinely affect African investors
+  'dollar shortage', 'currency devaluation', 'forex', 'capital controls',
+  'emerging market', 'imf', 'world bank',
+];
 
-// Words that add zero SEO value and make slugs look AI-generated.
+/**
+ * Returns true only when the source text contains terms that make
+ * African / Kenyan market framing genuinely relevant.
+ */
+function isAfricanContextRelevant(text: string): boolean {
+  const lower = text.toLowerCase();
+  return AFRICA_RELEVANT_TERMS.some(term => lower.includes(term));
+}
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 4 — SLUG GENERATOR
+// ─────────────────────────────────────────────────────────────
 const SLUG_FILLER = new Set([
   'the','a','an','and','or','but','in','on','at','to','for','of','with',
   'is','are','was','were','be','been','has','have','had','will','would',
   'that','this','it','as','by','from','its','their','they','about',
-  // AI-slop fillers
   'comprehensive','deep','dive','delve','unlock','empower','game','changer',
   'groundbreaking','revolutionary','transformative','pioneering','cutting','edge',
   'holistic','robust','synergy','ecosystem','landscape','journey','navigate',
@@ -153,7 +176,6 @@ function buildReferralLinks(urls: string[]): ReferralLink[] {
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 6 — TAG BUILDER
-// Scrubs banned words before they reach the post.
 // ─────────────────────────────────────────────────────────────
 const BANNED_TAGS = new Set([
   'sentiment', 'sentiments', 'analysis', 'landscape', 'ecosystem',
@@ -221,23 +243,16 @@ const COIN_MAP: Record<string, string> = {
   maker: 'maker', mkr: 'maker',
 };
 
-/**
- * Detects coins mentioned in the text.
- * IMPORTANT: Does NOT fall back to Bitcoin when no coin is found.
- * The caller decides what to do with an empty array.
- */
 function detectCoins(text: string): string[] {
   const lower = text.toLowerCase();
   const found = new Set<string>();
   for (const [keyword, coinId] of Object.entries(COIN_MAP)) {
     if (lower.includes(keyword)) found.add(coinId);
   }
-  // No fallback — only return coins that are actually in the text.
   return [...found].slice(0, 5);
 }
 
 async function fetchCoinData(coinIds: string[]): Promise<CoinData[]> {
-  // Nothing to fetch — don't hit CoinGecko at all.
   if (!coinIds.length) return [];
 
   try {
@@ -289,6 +304,79 @@ function formatCoinContext(coins: CoinData[]): string {
       );
     })
     .join('\n');
+}
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 7b — TELEGRAM QUICK UPDATE FORMATTER
+// Builds a visually distinct, skimmable Telegram message
+// for content that doesn't qualify as a full blog post.
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Picks a category icon so readers instantly know what they're looking at.
+ */
+function quickUpdateIcon(text: string): string {
+  const lower = text.toLowerCase();
+  if (/hack|exploit|breach|stolen|drained/.test(lower))           return '🚨';
+  if (/sec|regulation|law|ban|legal|court|ruling/.test(lower))    return '⚖️';
+  if (/ath|all.time high|record/.test(lower))                     return '🏆';
+  if (/crash|dump|drop|plunge|fell|lost/.test(lower))             return '📉';
+  if (/pump|surge|rally|soar|gains|up/.test(lower))               return '📈';
+  if (/airdrop|free token|claim/.test(lower))                     return '🎁';
+  if (/listing|delist/.test(lower))                               return '🔔';
+  if (/partnership|deal|integration/.test(lower))                 return '🤝';
+  if (/upgrade|fork|mainnet|launch/.test(lower))                  return '⚙️';
+  return '⚡';
+}
+
+/**
+ * Extracts the most important sentence from a short update — the one
+ * with a number, ticker, or named entity in it.
+ */
+function extractHeadline(text: string): string {
+  const sentences = text
+    .split(/(?<=[.!?])\s+/)
+    .map(s => s.trim())
+    .filter(s => s.length > 20);
+
+  // Prefer sentences that contain a price, percentage, or coin name
+  const hot = sentences.find(s => /\$[\d,]|[\d.]+%|btc|eth|sol|xrp|bnb/i.test(s));
+  return (hot || sentences[0] || text).slice(0, 160);
+}
+
+/**
+ * Formats a skimmable Telegram quick-update message.
+ * Structure: icon + bold headline → clean body → source tag
+ */
+function formatTelegramQuickUpdate(text: string, author: string): string {
+  const icon     = quickUpdateIcon(text);
+  const headline = extractHeadline(text);
+
+  // Clean body: strip markdown syntax that breaks Telegram HTML parse mode
+  const body = text
+    .replace(/\*\*/g, '')
+    .replace(/\*/g, '')
+    .replace(/`/g, '')
+    .replace(/_/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  // Trim to a readable length — keep it punchy, not a wall of text
+  const preview = body.length > 400 ? body.slice(0, 397) + '…' : body;
+
+  // Build the message with clear visual hierarchy
+  const lines: string[] = [
+    `${icon} <b>${headline}</b>`,
+    '',
+    preview,
+    '',
+    `<i>📡 Source: ${author}</i>`,
+  ];
+
+  // Deduplicate: if the headline is basically the first sentence of the
+  // preview, skip repeating the preview's first sentence
+  const fullMessage = lines.join('\n').trim();
+  return fullMessage;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -363,7 +451,6 @@ function estimateReadingTime(content: string): number {
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 11 — QUALITY GATE
-// Scores the post across 10 dimensions. Pass threshold: 75.
 // ─────────────────────────────────────────────────────────────
 interface QualityResult {
   passes: boolean;
@@ -404,14 +491,13 @@ function checkQuality(post: Post): QualityResult {
     }
   }
 
-  // 3. Live price data present — only if coins were actually detected (10 pts)
-  // If coinContext was "No specific coin price data", we don't penalise.
+  // 3. Live price data present (10 pts)
   const hasPriceData = /\$[\d,]+(\.\d+)?/.test(plainText);
   const isCoinlessStory = !post.content?.includes('▲') && !post.content?.includes('▼');
   if (hasPriceData || isCoinlessStory) {
     score += 10;
   } else {
-    reasons.push('No live price data embedded — add prices or ensure no coins are in source text');
+    reasons.push('No live price data embedded');
   }
 
   // 4. Meta title length 50-60 chars (10 pts)
@@ -430,7 +516,7 @@ function checkQuality(post: Post): QualityResult {
     reasons.push(`Meta description length off (${metaDescLen} chars, need 120-160)`);
   }
 
-  // 6. Full keyword phrase in title (10 pts)
+  // 6. Focus keyword in title (10 pts)
   if (fullKeyword && post.title?.toLowerCase().includes(fullKeyword)) {
     score += 10;
   } else {
@@ -445,11 +531,11 @@ function checkQuality(post: Post): QualityResult {
     if (density >= 0.5 && density <= 2.5) {
       score += 10;
     } else {
-      reasons.push(`Keyword density off (${density.toFixed(1)}% for "${fullKeyword}" — aim 0.5-2.5%)`);
+      reasons.push(`Keyword density off (${density.toFixed(1)}% — aim 0.5-2.5%)`);
     }
   }
 
-  // 8. H2 headings — at least 3 (relaxed from 4) (5 pts)
+  // 8. H2 headings — at least 3 (5 pts)
   const h2Count = (post.content?.match(/<h2>/gi) || []).length;
   if (h2Count >= 3) {
     score += 5;
@@ -477,7 +563,6 @@ function checkQuality(post: Post): QualityResult {
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 12 — FOCUS KEYWORD SANITISER
-// Strips banned words, caps at 4 words.
 // ─────────────────────────────────────────────────────────────
 const FORBIDDEN_IN_KEYWORD = new Set([
   'sentiment', 'sentiments', 'analysis',
@@ -497,9 +582,9 @@ function sanitiseFocusKeyword(raw: string): string {
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 13 — AI PROMPT
-// Loosened structure: no mandatory 5-section straitjacket.
-// Writer chooses natural headings that fit the story.
-// Coin rule: ONLY write about coins in the provided data.
+// African market context is conditional — only injected when
+// isAfricanContextRelevant() returns true.
+// Plain-language rules added to kill AI jargon.
 // ─────────────────────────────────────────────────────────────
 function buildPrompt(
   msg: NormalizedMessage,
@@ -507,6 +592,7 @@ function buildPrompt(
   coinContext: string,
   internalLinks: string,
   hasCoinData: boolean,
+  africanContextRelevant: boolean,
 ): string {
   const siteBaseUrl = process.env.SITE_BASE_URL || 'https://yourcryptosite.com';
 
@@ -530,13 +616,50 @@ Do NOT invent or insert cryptocurrency prices that are not in the source materia
 Write about the topic using factual context only.
 `;
 
+  // African context block: only shown when relevant to the story
+  const africanBlock = africanContextRelevant
+    ? `
+════════════════════════════════════════════
+REGIONAL CONTEXT — ONLY BECAUSE THIS STORY IS RELEVANT
+════════════════════════════════════════════
+This story has direct relevance to African or Kenyan readers.
+Where it genuinely fits, reference:
+- How this affects African traders or retail investors
+- Local exchange availability (e.g. Binance P2P, Yellow Card)
+- M-Pesa / mobile money where remittance or payments are involved
+- Currency or forex implications for markets like Kenya, Nigeria, or Ghana
+
+Do NOT force African references into sections where they don't naturally fit.
+One well-placed, specific regional paragraph is worth more than scattered mentions.
+`
+    : `
+════════════════════════════════════════════
+AUDIENCE
+════════════════════════════════════════════
+Write for a global crypto audience. Do NOT insert African, Kenyan, or M-Pesa
+references — this story has no direct regional angle. Keep framing universal.
+`;
+
   return `
-You are a senior crypto journalist with 10 years of experience at Bloomberg, CoinDesk, and The Block.
-Your writing is sharp, direct, and analytical. You write for a Kenyan and broader African audience —
-reference M-Pesa, local exchange availability, or African market context when it genuinely fits the story.
+You are a senior crypto journalist. Your writing is clear, direct, and grounded in facts.
+You write the way a good reporter writes — not the way a content generator writes.
 
 ⚠️ NON-NEGOTIABLE: Your "content" field must contain AT LEAST 800 words of readable body text.
-Strip all HTML tags mentally and count. If you are under 800 words, keep writing. Aim for 900-1000.
+Count words as you write. Aim for 900-1000.
+
+════════════════════════════════════════════
+PLAIN LANGUAGE RULES — READ THESE FIRST
+════════════════════════════════════════════
+Your writing must pass a simple test: could a smart 16-year-old read this and understand it?
+That means:
+• Use short, common words. "Use" not "utilise". "Show" not "demonstrate". "Buy" not "acquire".
+• Write short paragraphs — 3-4 sentences max. One idea per paragraph.
+• Every sentence must mean something. Cut anything that sounds like filler.
+• If you would not say it out loud in a normal conversation, rewrite it.
+• Explain jargon the first time you use it (e.g. "DeFi, short for decentralised finance").
+• Use active voice. "The SEC approved the ETF" not "The ETF was approved by the SEC".
+• Vary sentence length — mix short punchy sentences with longer ones.
+• Use specific numbers. "Bitcoin dropped 8% in 4 hours" beats "Bitcoin saw significant losses".
 
 ════════════════════════════════════════════
 SOURCE MATERIAL
@@ -547,6 +670,7 @@ CATEGORY: ${category}
 URLS: ${msg.urls.join(', ') || 'none'}
 HASHTAGS: ${msg.hashtags.join(', ') || 'none'}
 ${coinInstructions}
+${africanBlock}
 ════════════════════════════════════════════
 INTERNAL LINKS — INCLUDE AT LEAST 2
 ════════════════════════════════════════════
@@ -558,30 +682,41 @@ Never use "click here" or "read more" as anchor text.
 ════════════════════════════════════════════
 CONTENT STRUCTURE
 ════════════════════════════════════════════
-Write 4-6 H2 sections with headings that fit YOUR story — do not use generic placeholders.
+Write 4-6 H2 sections with headings that fit YOUR story — not generic placeholders.
 Good heading examples:
-  - "Why This Ruling Changes Everything for African Traders"
+  - "Why This Ruling Changes Everything for Traders"
   - "The Numbers Behind the Sell-Off"
   - "Three Scenarios for the Next 30 Days"
-  - "What Kenyan Investors Need to Know Right Now"
+  - "What This Means for Your Portfolio"
 
 Each section needs at least 2-3 substantial paragraphs. No one-liners.
-Vary sentence length: mix short punchy sentences with longer analytical ones.
 Use specific numbers and data throughout — percentages, dates, dollar figures.
 
 End the article with:
 <p><em>Disclaimer: This content is for informational purposes only and does not constitute financial advice. Always do your own research before investing.</em></p>
 
 ════════════════════════════════════════════
-BANNED WORDS — NEVER USE THESE
+BANNED WORDS — NEVER USE THESE ANYWHERE
 ════════════════════════════════════════════
-Anywhere in the article, title, meta fields, or tags:
-"sentiment", "sentiments", "analysis" (use "breakdown", "picture", "data", "read" instead)
-"it remains to be seen", "time will tell", "significant implications"
-"the crypto space", "as we know", "in the world of crypto"
-"at the time of writing", "it's worth noting", "needless to say"
-"at the end of the day", "landscape", "navigate", "journey" (metaphorical use)
-"unlock", "dive into", "delve"
+These words make writing sound like a robot. Remove them at every turn:
+
+AI jargon to kill:
+"it is worth noting", "it remains to be seen", "in the ever-evolving",
+"the crypto space", "as we know", "needless to say", "at the end of the day",
+"in the world of crypto", "at the time of writing", "game-changing",
+"paradigm", "groundbreaking", "revolutionary" (unless quoting someone),
+"transformative", "pioneering", "cutting-edge", "holistic", "robust",
+"synergy", "ecosystem" (use "market", "network", or "industry" instead),
+"landscape" (use "market" or "industry"), "navigate", "journey" (metaphorical),
+"unlock", "dive into", "delve", "empower", "leverage" (metaphorical — ok for trading context)
+
+SEO jargon to kill:
+"sentiment", "sentiments", "analysis" (use "breakdown", "picture", "data", "read"),
+"significant implications" (say what the implication actually is)
+
+Filler phrases to kill:
+"it is important to note", "this is a developing story" (unless it genuinely is),
+"time will tell", "only time will tell", "interesting to see"
 
 ════════════════════════════════════════════
 HTML: Use only <h2>, <p>, <ul>, <li>, <strong>, <em>, <a href="...">.
@@ -627,8 +762,9 @@ FINAL CHECKS BEFORE WRITING JSON
 3. meta_description exactly 120-160 chars? Count manually.
 4. focus_keyword in title verbatim? Fix if not.
 5. Any banned words used? Remove them.
+6. Does every sentence mean something? Cut filler.
 
-Only write JSON after all 5 checks pass.
+Only write JSON after all 6 checks pass.
 
 ════════════════════════════════════════════
 OUTPUT: VALID JSON ONLY
@@ -648,9 +784,6 @@ No markdown. No backticks. No text before or after. Escape all HTML inside JSON 
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 13b — REPAIR PROMPT
-// Called only when the first attempt fails quality checks.
-// Passes the existing draft back to the model with surgical
-// instructions covering only the specific issues found.
 // ─────────────────────────────────────────────────────────────
 function buildRepairPrompt(
   draft: Post,
@@ -667,7 +800,6 @@ function buildRepairPrompt(
   const kwMatches  = (plainText.toLowerCase().match(new RegExp(escaped, 'g')) || []).length;
   const density    = wordCount > 0 ? ((kwMatches / wordCount) * 100).toFixed(1) : '0.0';
 
-  // Build targeted fix instructions from actual failure reasons
   const fixes: string[] = [];
 
   if (reasons.some(r => r.includes('Word count'))) {
@@ -679,12 +811,11 @@ function buildRepairPrompt(
   }
 
   if (reasons.some(r => r.includes('Keyword density'))) {
-    const targetUses = Math.ceil(wordCount * 0.008); // ~0.8% as safe midpoint
+    const targetUses = Math.ceil(wordCount * 0.008);
     fixes.push(
       `KEYWORD DENSITY: "${keyword}" appears only ${kwMatches} times (${density}%). ` +
       `You need it to appear ~${targetUses} times (0.5-2.5%). ` +
-      `Work it naturally into headings, opening sentences of paragraphs, and the conclusion. ` +
-      `Do NOT force it awkwardly — find natural spots where it genuinely fits.`,
+      `Work it naturally into headings, opening sentences of paragraphs, and the conclusion.`,
     );
   }
 
@@ -725,8 +856,12 @@ function buildRepairPrompt(
 
   return `
 You wrote a draft article that failed our quality checks. Fix ONLY the specific issues listed below.
-Keep everything else exactly as it is — do not change the title, focus_keyword, tags, or any content
-that is already correct. Return the complete fixed article as valid JSON (same schema as before).
+Keep everything else exactly as it is. Return the complete fixed article as valid JSON.
+
+Also re-read the plain language rules before fixing:
+- Short, common words. Active voice. Short paragraphs. No filler sentences.
+- No AI jargon: no "it is worth noting", "ecosystem", "landscape", "delve", "navigate", "sentiment".
+- Every sentence must mean something concrete.
 
 FOCUS KEYWORD: "${keyword}"
 CURRENT WORD COUNT: ${wordCount} (minimum 800 required)
@@ -757,8 +892,6 @@ Same schema: title, content, excerpt, meta_title, meta_description, focus_keywor
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 13c — POST ASSEMBLER
-// Converts raw AI JSON into a typed Post object.
-// Extracted so both the first attempt and repair retry use it.
 // ─────────────────────────────────────────────────────────────
 function assemblePost(
   generated: Record<string, any>,
@@ -769,7 +902,6 @@ function assemblePost(
   const sanitised = { ...generated };
   sanitised.focus_keyword = sanitiseFocusKeyword(sanitised.focus_keyword || '');
 
-  // Build a shell first so schema can reference the slug
   const slug = slugify(sanitised.title);
 
   const post: Post = {
@@ -855,22 +987,12 @@ export const aiEnrichWorker = new Worker(
     // ── Step 1: Blog-worthiness filter ───────────────────────
     if (!shouldBlog(msg.text)) {
       const preview = msg.text.slice(0, 80).replace(/\n/g, ' ');
-      console.log(`[aiWorker] ⚡ Skipping blog from ${msg.author} — filtered by shouldBlog. Preview: "${preview}"`);
+      console.log(`[aiWorker] ⚡ Skipping blog from ${msg.author} — filtered. Preview: "${preview}"`);
 
-      // Strip markdown syntax that breaks Telegram's HTML parse mode,
-      // then trim to 300 chars for the quick update.
-      const cleanText = msg.text
-        .replace(/\*\*/g, '')   // remove bold markdown **
-        .replace(/\*/g, '')     // remove italic markdown *
-        .replace(/`/g, '')      // remove code ticks
-        .replace(/_/g, ' ')     // replace underscores used as italic
-        .trim();
-
-      // Only send to Telegram if there's actual content to show
-      if (cleanText.length > 0) {
+      if (msg.text.trim().length > 0) {
         const { sendToChannel } = await import('../workers/telegramNotifier');
-        const telegramPreview = cleanText.length > 300 ? cleanText.slice(0, 300) + '…' : cleanText;
-        await sendToChannel(`⚡ <b>Quick Update</b>\n\n${telegramPreview}`);
+        const formatted = formatTelegramQuickUpdate(msg.text, msg.author);
+        await sendToChannel(formatted);
       }
       return;
     }
@@ -884,9 +1006,14 @@ export const aiEnrichWorker = new Worker(
     }
 
     const category = classifyCategory(msg.text);
-    console.log(`[aiWorker] 🤖 Enriching [${category}] from ${msg.author} (source: ${msg.source})...`);
+    const africanContextRelevant = isAfricanContextRelevant(msg.text);
 
-    // ── Step 3: Detect coins — only what's actually in the text ─
+    console.log(
+      `[aiWorker] 🤖 Enriching [${category}] from ${msg.author} | ` +
+      `Africa context: ${africanContextRelevant ? 'YES' : 'no'} | source: ${msg.source}`,
+    );
+
+    // ── Step 3: Detect coins ──────────────────────────────────
     const detectedCoinIds = detectCoins(msg.text);
     const hasCoinData     = detectedCoinIds.length > 0;
 
@@ -914,23 +1041,24 @@ export const aiEnrichWorker = new Worker(
 
     const systemPrompt = model === 'gpt-4o'
       ? [
-          'You are a senior crypto journalist for a high-authority African news platform.',
-          'RULE 1 — WORD COUNT: Your "content" field must have 800+ words of readable body text. Count as you write.',
-          'RULE 2 — META TITLE: Must be exactly 50-60 characters including spaces. Count every character.',
-          'RULE 3 — COIN DISCIPLINE: Only write about coins mentioned in the provided market data. Never default to Bitcoin.',
-          'RULE 4 — NO BANNED WORDS: Never use "sentiment", "analysis", "landscape", "delve", "dive into" anywhere.',
-          'RULE 5 — JSON ONLY: Respond with valid JSON only. No markdown, no backticks, no extra text.',
+          'You are a senior crypto journalist for a high-authority news platform.',
+          'RULE 1 — PLAIN LANGUAGE: Write clearly. Short words. Short paragraphs. Active voice. No AI jargon.',
+          'RULE 2 — WORD COUNT: Your "content" field must have 800+ words of readable body text.',
+          'RULE 3 — META TITLE: Must be exactly 50-60 characters including spaces.',
+          'RULE 4 — COIN DISCIPLINE: Only write about coins in the provided market data.',
+          'RULE 5 — NO BANNED WORDS: Never use "sentiment", "ecosystem", "landscape", "delve", "navigate".',
+          'RULE 6 — JSON ONLY: Respond with valid JSON only. No markdown, no backticks, no extra text.',
         ].join('\n')
       : [
-          'You are a crypto journalist. Follow every rule exactly:',
-          '1. WORD COUNT: Minimum 800 words of body text. Count as you write.',
-          '2. META TITLE: Exactly 50-60 characters including spaces — count every character.',
-          '3. COIN DISCIPLINE: Only write about coins in the provided market data. Never default to Bitcoin.',
-          '4. Embed ALL price figures provided. Do not invent numbers.',
-          '5. Include at least 2 internal links from the list provided.',
-          '6. Use 4-6 H2 sections with story-specific headings (not generic placeholders).',
-          '7. NEVER use: "sentiment", "analysis", "landscape", "delve", "dive into" anywhere.',
-          '8. focus_keyword must be 2-4 words, specific to THIS story.',
+          'You are a crypto journalist. Write clearly — like a reporter, not a content bot.',
+          '1. PLAIN LANGUAGE: Short sentences. Common words. Active voice. No jargon.',
+          '2. WORD COUNT: Minimum 800 words of body text.',
+          '3. META TITLE: Exactly 50-60 characters including spaces.',
+          '4. COIN DISCIPLINE: Only write about coins in the provided market data.',
+          '5. Embed ALL price figures provided. Do not invent numbers.',
+          '6. Include at least 2 internal links from the list provided.',
+          '7. Use 4-6 H2 sections with story-specific headings.',
+          '8. NEVER use: "sentiment", "ecosystem", "landscape", "delve", "navigate", "it is worth noting".',
           '9. Return ONLY valid JSON — no markdown, no backticks, no extra text.',
         ].join('\n');
 
@@ -938,7 +1066,7 @@ export const aiEnrichWorker = new Worker(
     const siteBaseUrl  = process.env.SITE_BASE_URL || 'https://yourcryptosite.com';
     let post: Post;
 
-    // ── Helper: call OpenAI and parse JSON ──────────────────
+    // ── Helper: call OpenAI and parse JSON ────────────────────
     async function callAI(messages: { role: string; content: string }[]): Promise<Record<string, any>> {
       const response = await openai.chat.completions.create({
         model,
@@ -951,23 +1079,23 @@ export const aiEnrichWorker = new Worker(
       return JSON.parse(clean);
     }
 
-    // ── Helper: log post stats ──────────────────────────────
     function logPost(p: Post, attempt: 'first' | 'retry'): void {
       const wordCount = p.content?.replace(/<[^>]+>/g, '').split(/\s+/).filter(Boolean).length ?? 0;
       console.log(`[aiWorker] ✅ AI post generated (${attempt} attempt):`, {
-        model_used:     model,
-        title:          p.title,
-        slug:           p.slug,
-        category:       p.category,
-        focus_keyword:  p.focus_keyword,
-        word_count:     wordCount,
-        reading_time:   `${p.reading_time_min} min`,
-        meta_title_len: p.meta_title?.length,
-        meta_desc_len:  p.meta_description?.length,
-        tags_count:     p.tags?.length,
-        has_prices:     /\$[\d,]+(\.\d+)?/.test(p.content || ''),
-        has_int_links:  p.content?.includes('/posts/') ?? false,
-        coins_used:     detectedCoinIds,
+        model_used:          model,
+        title:               p.title,
+        slug:                p.slug,
+        category:            p.category,
+        focus_keyword:       p.focus_keyword,
+        word_count:          wordCount,
+        reading_time:        `${p.reading_time_min} min`,
+        meta_title_len:      p.meta_title?.length,
+        meta_desc_len:       p.meta_description?.length,
+        tags_count:          p.tags?.length,
+        has_prices:          /\$[\d,]+(\.\d+)?/.test(p.content || ''),
+        has_int_links:       p.content?.includes('/posts/') ?? false,
+        coins_used:          detectedCoinIds,
+        african_context:     africanContextRelevant,
       });
     }
 
@@ -975,7 +1103,12 @@ export const aiEnrichWorker = new Worker(
       // ── Step 6: First attempt ─────────────────────────────
       const generated = await callAI([
         { role: 'system', content: systemPrompt },
-        { role: 'user',   content: buildPrompt(msg, category, coinContext, internalLinksStr, hasCoinData) },
+        {
+          role: 'user',
+          content: buildPrompt(
+            msg, category, coinContext, internalLinksStr, hasCoinData, africanContextRelevant,
+          ),
+        },
       ]);
 
       post = assemblePost(generated, msg, category, publishedAt);
@@ -1017,12 +1150,10 @@ export const aiEnrichWorker = new Worker(
             (retryQuality.score > firstQuality.score ? '✅ improved' : '⚠️ no improvement, keeping retry anyway'),
           );
 
-          // Always use the retry result — it's at least as focused on the issues
           post = repairedPost;
 
         } catch (retryErr) {
           console.warn('[aiWorker] ⚠️ Repair retry failed, keeping first attempt:', retryErr);
-          // post stays as the first attempt
         }
       }
 

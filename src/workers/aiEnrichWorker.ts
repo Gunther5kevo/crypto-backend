@@ -308,26 +308,8 @@ function formatCoinContext(coins: CoinData[]): string {
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 7b — TELEGRAM QUICK UPDATE FORMATTER
-// Builds a visually distinct, skimmable Telegram message
-// for content that doesn't qualify as a full blog post.
+// Clean, professional format — no emoji, no source attribution.
 // ─────────────────────────────────────────────────────────────
-
-/**
- * Picks a category icon so readers instantly know what they're looking at.
- */
-function quickUpdateIcon(text: string): string {
-  const lower = text.toLowerCase();
-  if (/hack|exploit|breach|stolen|drained/.test(lower))           return '🚨';
-  if (/sec|regulation|law|ban|legal|court|ruling/.test(lower))    return '⚖️';
-  if (/ath|all.time high|record/.test(lower))                     return '🏆';
-  if (/crash|dump|drop|plunge|fell|lost/.test(lower))             return '📉';
-  if (/pump|surge|rally|soar|gains|up/.test(lower))               return '📈';
-  if (/airdrop|free token|claim/.test(lower))                     return '🎁';
-  if (/listing|delist/.test(lower))                               return '🔔';
-  if (/partnership|deal|integration/.test(lower))                 return '🤝';
-  if (/upgrade|fork|mainnet|launch/.test(lower))                  return '⚙️';
-  return '⚡';
-}
 
 /**
  * Extracts the most important sentence from a short update — the one
@@ -345,11 +327,10 @@ function extractHeadline(text: string): string {
 }
 
 /**
- * Formats a skimmable Telegram quick-update message.
- * Structure: icon + bold headline → clean body → source tag
+ * Formats a clean, professional Telegram quick-update message.
+ * Structure: bold headline → clean body → @cryptomoney handle
  */
-function formatTelegramQuickUpdate(text: string, author: string): string {
-  const icon     = quickUpdateIcon(text);
+function formatTelegramQuickUpdate(text: string, _author: string): string {
   const headline = extractHeadline(text);
 
   // Clean body: strip markdown syntax that breaks Telegram HTML parse mode
@@ -361,22 +342,18 @@ function formatTelegramQuickUpdate(text: string, author: string): string {
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 
-  // Trim to a readable length — keep it punchy, not a wall of text
+  // Trim to a readable length
   const preview = body.length > 400 ? body.slice(0, 397) + '…' : body;
 
-  // Build the message with clear visual hierarchy
   const lines: string[] = [
-    `${icon} <b>${headline}</b>`,
+    `<b>${headline}</b>`,
     '',
     preview,
     '',
-    `<i>📡 Source: ${author}</i>`,
+    `@cryptomoney`,
   ];
 
-  // Deduplicate: if the headline is basically the first sentence of the
-  // preview, skip repeating the preview's first sentence
-  const fullMessage = lines.join('\n').trim();
-  return fullMessage;
+  return lines.join('\n').trim();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -582,9 +559,6 @@ function sanitiseFocusKeyword(raw: string): string {
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 13 — AI PROMPT
-// African market context is conditional — only injected when
-// isAfricanContextRelevant() returns true.
-// Plain-language rules added to kill AI jargon.
 // ─────────────────────────────────────────────────────────────
 function buildPrompt(
   msg: NormalizedMessage,
@@ -616,7 +590,6 @@ Do NOT invent or insert cryptocurrency prices that are not in the source materia
 Write about the topic using factual context only.
 `;
 
-  // African context block: only shown when relevant to the story
   const africanBlock = africanContextRelevant
     ? `
 ════════════════════════════════════════════

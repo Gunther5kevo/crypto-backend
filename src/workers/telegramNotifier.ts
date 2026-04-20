@@ -52,34 +52,29 @@ export const telegramNotifier = new Worker(
     const siteUrl = (process.env.SITE_URL || 'https://cryptomonieid.com').replace(/\/$/, '');
     const postUrl = `${siteUrl}/blog/${post.slug}`;
 
-    const emoji =
-      post.category === 'airdrop' ? '🪂' :
-      post.category === 'signal'  ? '📊' :
-      '📰';
-
     const categoryLabel =
       post.category === 'airdrop' ? 'Airdrop Alert' :
       post.category === 'signal'  ? 'Trading Signal' :
       'Crypto News';
 
     const keyPoints = extractKeyPoints(post.content || '');
-    const bulletPoints = keyPoints.map(p => `• ${p}`).join('\n');
+    const bulletPoints = keyPoints.map(p => `— ${p}`).join('\n');
     const hashtags = post.tags?.map(t => `#${t.replace(/\s+/g, '')}`).join(' ') || '';
 
     const message = [
-      `${emoji} <b>${categoryLabel.toUpperCase()}</b>`,
+      `<b>${categoryLabel}</b>`,
       ``,
       `<b>${post.title}</b>`,
       ``,
-      `${post.excerpt}`,
+      post.excerpt,
       ``,
-      `<b>Key Points:</b>`,
-      `${bulletPoints}`,
+      bulletPoints,
       ``,
-      `━━━━━━━━━━━━━━`,
-      `🌐 <a href="${postUrl}">Read Full Article</a>`,
+      `<a href="${postUrl}">Read the full article</a>`,
       ``,
       `${hashtags}`,
+      ``,
+      `@cryptomoney`,
     ].join('\n');
 
     await sendToChannel(message);

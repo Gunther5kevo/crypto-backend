@@ -331,10 +331,13 @@ function extractHeadline(text: string): string {
  * Structure: bold headline → clean body → @cryptomoney handle
  */
 function formatTelegramQuickUpdate(text: string, _author: string): string {
-  const headline = extractHeadline(text);
+  // Strip any @handle mentions so source channel names don't bleed through
+  const stripped = text.replace(/@\w+/g, '').replace(/\n{3,}/g, '\n\n').trim();
+
+  const headline = extractHeadline(stripped);
 
   // Clean body: strip markdown syntax that breaks Telegram HTML parse mode
-  const body = text
+  const body = stripped
     .replace(/\*\*/g, '')
     .replace(/\*/g, '')
     .replace(/`/g, '')
@@ -899,6 +902,10 @@ function assemblePost(
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 14 — HYBRID MODEL SELECTOR
+// gpt-5.4      → 500,000 TPM | 500 RPM |   900,000 TPD  (breaking, signals, guides, trending)
+// gpt-5.4-mini → 200,000 TPM | 500 RPM | 2,000,000 TPD  (routine — lower cost, higher daily cap)
+// Both share 500 RPM so the pipeline won't bottleneck at normal volume.
+// max_tokens per call: 6,000 — well within both models' limits.
 // ─────────────────────────────────────────────────────────────
 const BREAKING_NEWS_KEYWORDS = [
   'sec', 'etf', 'approved', 'banned', 'hack', 'exploit', 'crashed',
@@ -919,27 +926,27 @@ function selectModel(
   const lower = text.toLowerCase();
 
   if (category === 'signal') {
-    return { model: 'gpt-4o', reason: 'trading signal — accuracy critical' };
+    return { model: 'gpt-5.4', reason: 'trading signal — accuracy critical' };
   }
 
   if (category === 'guide') {
-    return { model: 'gpt-4o', reason: 'educational guide — depth required' };
+    return { model: 'gpt-5.4', reason: 'educational guide — depth required' };
   }
 
   const hotCoin = coinData.find(c => Math.abs(c.change24h) >= 5);
   if (hotCoin) {
     return {
-      model: 'gpt-4o',
+      model: 'gpt-5.4',
       reason: `trending — ${hotCoin.symbol} moved ${hotCoin.change24h.toFixed(1)}% in 24h`,
     };
   }
 
   const isBreaking = BREAKING_NEWS_KEYWORDS.some(kw => lower.includes(kw));
   if (isBreaking) {
-    return { model: 'gpt-4o', reason: 'breaking/geopolitical news keyword detected' };
+    return { model: 'gpt-5.4', reason: 'breaking/geopolitical news keyword detected' };
   }
 
-  return { model: 'gpt-4o-mini', reason: 'routine content — cost optimised' };
+  return { model: 'gpt-5.4-mini', reason: 'routine content — cost optimised' };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1010,9 +1017,9 @@ export const aiEnrichWorker = new Worker(
     const { model, reason } = selectModel(msg.text, category, coinData);
     console.log(`[aiWorker] 🧠 Model: ${model} (${reason})`);
 
-    const temperature = model === 'gpt-4o' ? 0.55 : 0.40;
+    const temperature = model === 'gpt-5.4' ? 0.55 : 0.40;
 
-    const systemPrompt = model === 'gpt-4o'
+    const systemPrompt = model === 'gpt-5.4'
       ? [
           'You are a senior crypto journalist for a high-authority news platform.',
           'RULE 1 — PLAIN LANGUAGE: Write clearly. Short words. Short paragraphs. Active voice. No AI jargon.',

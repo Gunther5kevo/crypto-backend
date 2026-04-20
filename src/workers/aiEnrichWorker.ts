@@ -387,10 +387,10 @@ async function fetchInternalLinks(category: string): Promise<InternalLink[]> {
   }
 }
 
-function formatInternalLinks(links: InternalLink[]): string {
+function formatInternalLinks(links: InternalLink[], siteBaseUrl: string): string {
   if (!links.length) return 'No internal links available yet.';
   return links
-    .map(l => `- "${l.title}" → /posts/${l.slug}`)
+    .map(l => `<a href="${siteBaseUrl}/posts/${l.slug}">${l.title}</a>`)
     .join('\n');
 }
 
@@ -648,12 +648,19 @@ HASHTAGS: ${msg.hashtags.join(', ') || 'none'}
 ${coinInstructions}
 ${africanBlock}
 ════════════════════════════════════════════
-INTERNAL LINKS — INCLUDE AT LEAST 2
+INTERNAL LINKS — COPY THESE EXACTLY, DO NOT MODIFY
 ════════════════════════════════════════════
+The following are complete, ready-to-use anchor tags. Copy at least 2 of them
+VERBATIM into your content where they fit naturally.
+
 ${internalLinks}
-Link to at least 2 of these naturally within your content:
-<a href="${siteBaseUrl}/posts/SLUG">Anchor text that reads naturally</a>
-Never use "click here" or "read more" as anchor text.
+
+RULES — read carefully:
+- Copy the full <a href="...">...</a> tag exactly as shown above. Do NOT change the href.
+- Do NOT invent, guess, or construct any link that is not in the list above.
+- Do NOT paraphrase the anchor text — use it exactly as written.
+- If none of the links fit naturally, use the first 2 in the list regardless.
+- NEVER write a link like <a href="/posts/some-title-you-made-up">...</a>.
 
 ════════════════════════════════════════════
 CONTENT STRUCTURE
@@ -817,8 +824,9 @@ function buildRepairPrompt(
 
   if (reasons.some(r => r.includes('internal links'))) {
     fixes.push(
-      `INTERNAL LINKS: No internal links found. Add at least 2 links from this list:\n${internalLinks}\n` +
-      `Use: <a href="${siteBaseUrl}/posts/SLUG">natural anchor text</a>`,
+      `INTERNAL LINKS: No internal links found. Copy at least 2 of these complete anchor tags VERBATIM into your content:\n` +
+      `${internalLinks}\n` +
+      `DO NOT modify the href. DO NOT invent links not in this list.`,
     );
   }
 
@@ -867,6 +875,32 @@ Same schema: title, content, excerpt, meta_title, meta_description, focus_keywor
 }
 
 // ─────────────────────────────────────────────────────────────
+// SECTION 13b2 — INTERNAL LINK SANITISER
+// The AI sometimes constructs its own /posts/invented-slug links
+// even when given complete anchor tags. This function runs after
+// generation and strips every <a href="/posts/..."> that is NOT
+// in the list of real slugs we provided, replacing the tag with
+// plain text so readers never hit a 404.
+// ─────────────────────────────────────────────────────────────
+function sanitiseInternalLinks(content: string, allowedLinks: InternalLink[]): string {
+  const allowedSlugs = new Set(allowedLinks.map(l => l.slug));
+
+  // Match every internal anchor tag: <a href="/posts/ANYTHING">...</a>
+  return content.replace(
+    /<a\s+href="[^"]*\/posts\/([^"]+)"[^>]*>(.*?)<\/a>/gi,
+    (_match, slug, anchorText) => {
+      if (allowedSlugs.has(slug)) {
+        // Real link — keep it exactly as-is
+        return _match;
+      }
+      // Invented slug — strip the link, keep only the anchor text
+      console.log(`[aiWorker] 🔗 Removed invented internal link: /posts/${slug}`);
+      return anchorText;
+    },
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 // SECTION 13c — POST ASSEMBLER
 // ─────────────────────────────────────────────────────────────
 function assemblePost(
@@ -874,11 +908,15 @@ function assemblePost(
   msg: NormalizedMessage,
   category: string,
   publishedAt: string,
+  internalLinks: InternalLink[],
 ): Post {
   const sanitised = { ...generated };
   sanitised.focus_keyword = sanitiseFocusKeyword(sanitised.focus_keyword || '');
 
   const slug = slugify(sanitised.title);
+
+  // Strip any invented internal links the AI constructed
+  sanitised.content = sanitiseInternalLinks(sanitised.content || '', internalLinks);
 
   const post: Post = {
     title:            sanitised.title,
@@ -959,6 +997,15 @@ function shouldPublish(source: string, score: number): boolean {
 // ─────────────────────────────────────────────────────────────
 // SECTION 16 — MAIN WORKER
 // ─────────────────────────────────────────────────────────────
+
+// In-memory lock — prevents duplicate jobs for the same message from racing
+// through the queue simultaneously before either is saved to the database.
+const processingLock = new Set<string>();
+
+function messageFingerprint(text: string): string {
+  return text.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 120);
+}
+
 export const aiEnrichWorker = new Worker(
   'ingest_message',
   async (job: Job) => {
@@ -977,13 +1024,22 @@ export const aiEnrichWorker = new Worker(
       return;
     }
 
-    // ── Step 2: Deduplication check ──────────────────────────
-    const titlePreview = msg.text.split(/[.\n]/)[0].slice(0, 80);
-    const duplicate = await isDuplicate(msg.text, titlePreview);
-    if (duplicate) {
-      console.log(`[aiWorker] 🔁 Skipping duplicate story from ${msg.author}`);
+    // ── Step 2a: In-memory race lock ─────────────────────────
+    const fingerprint = messageFingerprint(msg.text);
+    if (processingLock.has(fingerprint)) {
+      console.log(`[aiWorker] 🔒 Race lock hit — already processing this message, skipping`);
       return;
     }
+    processingLock.add(fingerprint);
+
+    try {
+      // ── Step 2b: Deduplication check (database) ──────────────
+      const titlePreview = msg.text.split(/[.\n]/)[0].slice(0, 80);
+      const duplicate = await isDuplicate(msg.text, titlePreview);
+      if (duplicate) {
+        console.log(`[aiWorker] 🔁 Skipping duplicate story from ${msg.author}`);
+        return;
+      }
 
     const category = classifyCategory(msg.text);
     const africanContextRelevant = isAfricanContextRelevant(msg.text);
@@ -1003,6 +1059,8 @@ export const aiEnrichWorker = new Worker(
         : `[aiWorker] 🪙 No coins detected — skipping price fetch`,
     );
 
+    const siteBaseUrl = process.env.SITE_BASE_URL || 'https://yourcryptosite.com';
+
     // ── Step 4: Fetch market data + internal links in parallel ─
     const [coinData, internalLinks] = await Promise.all([
       fetchCoinData(detectedCoinIds),
@@ -1010,7 +1068,7 @@ export const aiEnrichWorker = new Worker(
     ]);
 
     const coinContext      = formatCoinContext(coinData);
-    const internalLinksStr = formatInternalLinks(internalLinks);
+    const internalLinksStr = formatInternalLinks(internalLinks, siteBaseUrl);
     console.log(`[aiWorker] 📈 Market + internal links ready (${internalLinks.length} links)`);
 
     // ── Step 5: Pick model ────────────────────────────────────
@@ -1043,7 +1101,6 @@ export const aiEnrichWorker = new Worker(
         ].join('\n');
 
     const publishedAt  = new Date().toISOString();
-    const siteBaseUrl  = process.env.SITE_BASE_URL || 'https://yourcryptosite.com';
     let post: Post;
 
     // ── Helper: call OpenAI and parse JSON ────────────────────
@@ -1052,7 +1109,7 @@ export const aiEnrichWorker = new Worker(
         model,
         messages: messages as any,
         temperature,
-        max_tokens: 6000,
+        max_completion_tokens: 6000,
       });
       const raw   = response.choices[0].message.content || '';
       const clean = raw.replace(/```json|```/g, '').trim();
@@ -1091,7 +1148,7 @@ export const aiEnrichWorker = new Worker(
         },
       ]);
 
-      post = assemblePost(generated, msg, category, publishedAt);
+      post = assemblePost(generated, msg, category, publishedAt, internalLinks);
       logPost(post, 'first');
 
       // ── Step 7: Quality check — repair if needed ──────────
@@ -1120,7 +1177,7 @@ export const aiEnrichWorker = new Worker(
             },
           ]);
 
-          const repairedPost = assemblePost(repaired, msg, category, publishedAt);
+          const repairedPost = assemblePost(repaired, msg, category, publishedAt, internalLinks);
           const retryQuality = checkQuality(repairedPost);
 
           logPost(repairedPost, 'retry');
@@ -1173,12 +1230,16 @@ export const aiEnrichWorker = new Worker(
       console.log('[aiWorker] ⚠️ Quality issues:', quality.reasons);
     }
 
-    if (publish) {
-      await storeQueue.add('store_post', post);
-      console.log(`[aiWorker] 📤 → store queue: ${post.slug}`);
-    } else {
-      await draftQueue.add('draft_post', post);
-      console.log(`[aiWorker] 📥 → draft queue: ${post.slug}`);
+      if (publish) {
+        await storeQueue.add('store_post', post);
+        console.log(`[aiWorker] 📤 → store queue: ${post.slug}`);
+      } else {
+        await draftQueue.add('draft_post', post);
+        console.log(`[aiWorker] 📥 → draft queue: ${post.slug}`);
+      }
+    } finally {
+      // Always release the lock so retries and future messages aren't blocked
+      processingLock.delete(fingerprint);
     }
   },
   { connection: redisConnection },

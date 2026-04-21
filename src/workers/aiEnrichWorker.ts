@@ -16,6 +16,7 @@ function shouldBlog(text: string): boolean {
 
   if (wordCount < 10) return false;
 
+  // ── Price ticker lines ───────────────────────────────────────
   const priceTicker = /^[a-z\s/]+:\s*\$[\d,]+(\.\d+)?\s*[▲▼]?\s*[\d.]+%\s*$/i;
   if (priceTicker.test(lower)) return false;
 
@@ -23,12 +24,69 @@ function shouldBlog(text: string): boolean {
   const priceLines = lines.filter(l => /\$[\d,]+(\.\d+)?/.test(l));
   if (lines.length > 3 && priceLines.length / lines.length > 0.7) return false;
 
+  // ── Crypto slang one-liners ──────────────────────────────────
   const junkPatterns = [
     /^\d[\d\s.,]+$/,
     /^(gm|gn|lfg|wagmi|ngmi|hodl)[\s!.]*$/i,
     /^(wen\s+moon|to\s+the\s+moon)[\s!.]*$/i,
   ];
   if (junkPatterns.some(p => p.test(lower))) return false;
+
+  // ── Spam / marketplace / self-promo patterns ─────────────────
+  const SPAM_PATTERNS: RegExp[] = [
+    // Account / channel sales
+    /\b(selling|sell|buy|purchase|for sale|available)\b.{0,40}\b(account|channel|handle|username|page|profile)\b/i,
+    /\b(twitter|x\.com|instagram|tiktok|telegram|youtube|discord)\b.{0,40}\b(account|channel|page)\b.{0,30}\b(sale|sell|selling|cheap|dm|contact)\b/i,
+
+    // Follower / subscriber counts as selling point
+    /\b\d[\d,k]+\s*(followers?|subscribers?|members?)\b.{0,60}\b(sale|sell|selling|dm|price|cheap|buy)\b/i,
+
+    // "DM me / contact me for ..."
+    /\b(dm\s*(me|us|for)|contact\s*(me|us)\s*for|inbox\s*me|message\s*me\s*for)\b.{0,60}\b(price|details|info|order|buy|purchase)\b/i,
+
+    // Referral / affiliate link pushing
+    /\buse\s+my\s+(referral|ref|code|link|promo)\b/i,
+    /\b(referral|ref)\s+(code|link|bonus)\b.{0,40}\b(earn|get|receive|bonus|reward)\b/i,
+
+    // "Join my group / channel / community"
+    /\bjoin\s+(my|our)\s+(group|channel|community|vip|signal|telegram|whatsapp)\b/i,
+    /\b(free|paid)\s+(signals?|calls?|tips?)\s+(channel|group|telegram|whatsapp)\b/i,
+
+    // Pump group invites
+    /\b(pump\s+group|pump\s+signal|pump\s+call|next\s+100x|guaranteed\s+(profit|return|gain))\b/i,
+
+    // Generic marketplace listing noise
+    /\b(inbox|whatsapp|call|text)\s+me\s+(for|to)\s+(order|buy|details|price)\b/i,
+    /\bprices?\s+start\s+(from|at)\s+\$[\d,]+/i,
+
+    // "I am / we are selling ..."
+    /\b(i\s+am|i'm|we\s+are|we're)\s+selling\b/i,
+
+    // Shilling unknown tokens with buy links
+    /\b(100x|1000x)\s+(gem|potential|guaranteed|incoming)\b/i,
+    /\b(buy\s+now|invest\s+now|don't\s+miss\s+out|last\s+chance)\b.{0,40}\b(token|coin|presale|ido|ico)\b/i,
+
+    // Presale / IDO spam
+    /\b(presale|pre-sale|private\s+sale)\s+(is\s+)?(live|open|now|going)\b/i,
+
+    // Giveaway bait
+    /\b(free\s+crypto|free\s+bitcoin|free\s+usdt|giveaway)\b.{0,60}\b(send|transfer|dm|click|join|follow)\b/i,
+
+    // Generic "I am selling" variations without requiring object noun
+    /\bi\s+(am\s+)?sell(ing)?\b/i,
+
+    // "Available for purchase / available cheap"
+    /\bavailable\b.{0,30}\b(for\s+(purchase|sale|order)|cheap|affordable)\b/i,
+
+    // Suspicious link-click baiting
+    /\b(click\s+(the\s+)?(link|button|here)|tap\s+(the\s+)?(link|here))\b.{0,40}\b(earn|profit|free|bonus|reward)\b/i,
+  ];
+
+  if (SPAM_PATTERNS.some(p => p.test(lower))) {
+    const preview = text.slice(0, 80).replace(/\n/g, ' ');
+    console.log(`[aiWorker] 🚫 Spam pattern matched — skipping: "${preview}"`);
+    return false;
+  }
 
   return true;
 }
@@ -128,10 +186,6 @@ const AFRICA_RELEVANT_TERMS = [
   'emerging market', 'imf', 'world bank',
 ];
 
-/**
- * Returns true only when the source text contains terms that make
- * African / Kenyan market framing genuinely relevant.
- */
 function isAfricanContextRelevant(text: string): boolean {
   const lower = text.toLowerCase();
   return AFRICA_RELEVANT_TERMS.some(term => lower.includes(term));
@@ -308,35 +362,20 @@ function formatCoinContext(coins: CoinData[]): string {
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 7b — TELEGRAM QUICK UPDATE FORMATTER
-// Clean, professional format — no emoji, no source attribution.
 // ─────────────────────────────────────────────────────────────
-
-/**
- * Extracts the most important sentence from a short update — the one
- * with a number, ticker, or named entity in it.
- */
 function extractHeadline(text: string): string {
   const sentences = text
     .split(/(?<=[.!?])\s+/)
     .map(s => s.trim())
     .filter(s => s.length > 20);
 
-  // Prefer sentences that contain a price, percentage, or coin name
   const hot = sentences.find(s => /\$[\d,]|[\d.]+%|btc|eth|sol|xrp|bnb/i.test(s));
   return (hot || sentences[0] || text).slice(0, 160);
 }
 
-/**
- * Formats a clean, professional Telegram quick-update message.
- * Structure: bold headline → clean body → @cryptomoney handle
- */
 function formatTelegramQuickUpdate(text: string, _author: string): string {
-  // Strip any @handle mentions so source channel names don't bleed through
   const stripped = text.replace(/@\w+/g, '').replace(/\n{3,}/g, '\n\n').trim();
-
   const headline = extractHeadline(stripped);
-
-  // Clean body: strip markdown syntax that breaks Telegram HTML parse mode
   const body = stripped
     .replace(/\*\*/g, '')
     .replace(/\*/g, '')
@@ -345,7 +384,6 @@ function formatTelegramQuickUpdate(text: string, _author: string): string {
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 
-  // Trim to a readable length
   const preview = body.length > 400 ? body.slice(0, 397) + '…' : body;
 
   const lines: string[] = [
@@ -648,19 +686,19 @@ HASHTAGS: ${msg.hashtags.join(', ') || 'none'}
 ${coinInstructions}
 ${africanBlock}
 ════════════════════════════════════════════
-INTERNAL LINKS — COPY THESE EXACTLY, DO NOT MODIFY
+INTERNAL LINKS — CRITICAL RULES
 ════════════════════════════════════════════
-The following are complete, ready-to-use anchor tags. Copy at least 2 of them
-VERBATIM into your content where they fit naturally.
+You MUST use EXACTLY 2 internal links from the list below.
+Copy the full <a href="...">...</a> tag VERBATIM — do NOT modify the href or anchor text.
+Do NOT invent, guess, or construct any link that is not in the list below.
+Do NOT add a third internal link. Exactly 2. No more, no less.
 
 ${internalLinks}
 
-RULES — read carefully:
-- Copy the full <a href="...">...</a> tag exactly as shown above. Do NOT change the href.
-- Do NOT invent, guess, or construct any link that is not in the list above.
-- Do NOT paraphrase the anchor text — use it exactly as written.
-- If none of the links fit naturally, use the first 2 in the list regardless.
-- NEVER write a link like <a href="/posts/some-title-you-made-up">...</a>.
+CHECKLIST before finishing:
+✓ Did you copy exactly 2 links from the list above?
+✓ Are both hrefs exactly as shown — not modified, not invented?
+✓ Are there NO extra /posts/ links beyond these 2?
 
 ════════════════════════════════════════════
 CONTENT STRUCTURE
@@ -746,8 +784,9 @@ FINAL CHECKS BEFORE WRITING JSON
 4. focus_keyword in title verbatim? Fix if not.
 5. Any banned words used? Remove them.
 6. Does every sentence mean something? Cut filler.
+7. Exactly 2 internal links used, both copied verbatim from the list? Verify.
 
-Only write JSON after all 6 checks pass.
+Only write JSON after all 7 checks pass.
 
 ════════════════════════════════════════════
 OUTPUT: VALID JSON ONLY
@@ -824,9 +863,9 @@ function buildRepairPrompt(
 
   if (reasons.some(r => r.includes('internal links'))) {
     fixes.push(
-      `INTERNAL LINKS: No internal links found. Copy at least 2 of these complete anchor tags VERBATIM into your content:\n` +
+      `INTERNAL LINKS: No internal links found. Copy EXACTLY 2 of these complete anchor tags VERBATIM into your content:\n` +
       `${internalLinks}\n` +
-      `DO NOT modify the href. DO NOT invent links not in this list.`,
+      `DO NOT modify the href. DO NOT invent links not in this list. Use exactly 2 — not 1, not 3.`,
     );
   }
 
@@ -876,26 +915,50 @@ Same schema: title, content, excerpt, meta_title, meta_description, focus_keywor
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 13b2 — INTERNAL LINK SANITISER
-// The AI sometimes constructs its own /posts/invented-slug links
-// even when given complete anchor tags. This function runs after
-// generation and strips every <a href="/posts/..."> that is NOT
-// in the list of real slugs we provided, replacing the tag with
-// plain text so readers never hit a 404.
+// Strips every <a> tag whose href is NOT an exact allowed /posts/slug.
+// This catches: invented slugs, external URLs the AI made up,
+// /blog/... paths, and any other non-approved anchor.
 // ─────────────────────────────────────────────────────────────
 function sanitiseInternalLinks(content: string, allowedLinks: InternalLink[]): string {
   const allowedSlugs = new Set(allowedLinks.map(l => l.slug));
 
-  // Match every internal anchor tag: <a href="/posts/ANYTHING">...</a>
+  // Match ALL anchor tags regardless of href format
   return content.replace(
-    /<a\s+href="[^"]*\/posts\/([^"]+)"[^>]*>(.*?)<\/a>/gi,
-    (_match, slug, anchorText) => {
-      if (allowedSlugs.has(slug)) {
-        // Real link — keep it exactly as-is
-        return _match;
+    /<a\s[^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/gi,
+    (_match, href, anchorText) => {
+      // Only keep links that are exact /posts/{slug} matches in the allowed set
+      const internalMatch = href.match(/\/posts\/([^"/?#]+)/);
+      if (internalMatch && allowedSlugs.has(internalMatch[1])) {
+        return _match; // Legitimate — keep exactly as-is
       }
-      // Invented slug — strip the link, keep only the anchor text
-      console.log(`[aiWorker] 🔗 Removed invented internal link: /posts/${slug}`);
-      return anchorText;
+      // Everything else: invented slugs, external links, /blog/... etc.
+      console.log(`[aiWorker] 🔗 Removed invented/external link: ${href}`);
+      return anchorText; // Strip tag, keep readable text
+    },
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 13b3 — INTERNAL LINK CAP
+// Hard-caps the number of internal /posts/ links to `max`.
+// Runs after sanitiseInternalLinks so only real slugs remain.
+// ─────────────────────────────────────────────────────────────
+function capInternalLinks(
+  content: string,
+  allowedLinks: InternalLink[],
+  max: number,
+): string {
+  const allowedSlugs = new Set(allowedLinks.map(l => l.slug));
+  let count = 0;
+
+  return content.replace(
+    /<a\s[^>]*href="[^"]*\/posts\/([^"/?#]+)"[^>]*>(.*?)<\/a>/gi,
+    (_match, slug, anchorText) => {
+      if (!allowedSlugs.has(slug)) return anchorText; // Shouldn't happen after sanitise, safety net
+      count++;
+      if (count <= max) return _match; // Within cap — keep
+      console.log(`[aiWorker] 🔗 Removed excess internal link (${count}/${max}): /posts/${slug}`);
+      return anchorText; // Over cap — strip link, keep text
     },
   );
 }
@@ -915,8 +978,11 @@ function assemblePost(
 
   const slug = slugify(sanitised.title);
 
-  // Strip any invented internal links the AI constructed
+  // Step 1: strip all invented / external links the AI constructed
   sanitised.content = sanitiseInternalLinks(sanitised.content || '', internalLinks);
+
+  // Step 2: hard-cap real internal links at exactly 2
+  sanitised.content = capInternalLinks(sanitised.content, internalLinks, 2);
 
   const post: Post = {
     title:            sanitised.title,
@@ -940,10 +1006,6 @@ function assemblePost(
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 14 — HYBRID MODEL SELECTOR
-// gpt-5.4      → 500,000 TPM | 500 RPM |   900,000 TPD  (breaking, signals, guides, trending)
-// gpt-5.4-mini → 200,000 TPM | 500 RPM | 2,000,000 TPD  (routine — lower cost, higher daily cap)
-// Both share 500 RPM so the pipeline won't bottleneck at normal volume.
-// max_tokens per call: 6,000 — well within both models' limits.
 // ─────────────────────────────────────────────────────────────
 const BREAKING_NEWS_KEYWORDS = [
   'sec', 'etf', 'approved', 'banned', 'hack', 'exploit', 'crashed',
@@ -997,9 +1059,6 @@ function shouldPublish(source: string, score: number): boolean {
 // ─────────────────────────────────────────────────────────────
 // SECTION 16 — MAIN WORKER
 // ─────────────────────────────────────────────────────────────
-
-// In-memory lock — prevents duplicate jobs for the same message from racing
-// through the queue simultaneously before either is saved to the database.
 const processingLock = new Set<string>();
 
 function messageFingerprint(text: string): string {
@@ -1041,194 +1100,197 @@ export const aiEnrichWorker = new Worker(
         return;
       }
 
-    const category = classifyCategory(msg.text);
-    const africanContextRelevant = isAfricanContextRelevant(msg.text);
+      const category = classifyCategory(msg.text);
+      const africanContextRelevant = isAfricanContextRelevant(msg.text);
 
-    console.log(
-      `[aiWorker] 🤖 Enriching [${category}] from ${msg.author} | ` +
-      `Africa context: ${africanContextRelevant ? 'YES' : 'no'} | source: ${msg.source}`,
-    );
+      console.log(
+        `[aiWorker] 🤖 Enriching [${category}] from ${msg.author} | ` +
+        `Africa context: ${africanContextRelevant ? 'YES' : 'no'} | source: ${msg.source}`,
+      );
 
-    // ── Step 3: Detect coins ──────────────────────────────────
-    const detectedCoinIds = detectCoins(msg.text);
-    const hasCoinData     = detectedCoinIds.length > 0;
+      // ── Step 3: Detect coins ──────────────────────────────────
+      const detectedCoinIds = detectCoins(msg.text);
+      const hasCoinData     = detectedCoinIds.length > 0;
 
-    console.log(
-      hasCoinData
-        ? `[aiWorker] 🪙 Coins detected: ${detectedCoinIds.join(', ')}`
-        : `[aiWorker] 🪙 No coins detected — skipping price fetch`,
-    );
+      console.log(
+        hasCoinData
+          ? `[aiWorker] 🪙 Coins detected: ${detectedCoinIds.join(', ')}`
+          : `[aiWorker] 🪙 No coins detected — skipping price fetch`,
+      );
 
-    const siteBaseUrl = process.env.SITE_BASE_URL || 'https://yourcryptosite.com';
+      const siteBaseUrl = process.env.SITE_BASE_URL || 'https://yourcryptosite.com';
 
-    // ── Step 4: Fetch market data + internal links in parallel ─
-    const [coinData, internalLinks] = await Promise.all([
-      fetchCoinData(detectedCoinIds),
-      fetchInternalLinks(category),
-    ]);
-
-    const coinContext      = formatCoinContext(coinData);
-    const internalLinksStr = formatInternalLinks(internalLinks, siteBaseUrl);
-    console.log(`[aiWorker] 📈 Market + internal links ready (${internalLinks.length} links)`);
-
-    // ── Step 5: Pick model ────────────────────────────────────
-    const { model, reason } = selectModel(msg.text, category, coinData);
-    console.log(`[aiWorker] 🧠 Model: ${model} (${reason})`);
-
-    const temperature = model === 'gpt-5.4' ? 0.55 : 0.40;
-
-    const systemPrompt = model === 'gpt-5.4'
-      ? [
-          'You are a senior crypto journalist for a high-authority news platform.',
-          'RULE 1 — PLAIN LANGUAGE: Write clearly. Short words. Short paragraphs. Active voice. No AI jargon.',
-          'RULE 2 — WORD COUNT: Your "content" field must have 800+ words of readable body text.',
-          'RULE 3 — META TITLE: Must be exactly 50-60 characters including spaces.',
-          'RULE 4 — COIN DISCIPLINE: Only write about coins in the provided market data.',
-          'RULE 5 — NO BANNED WORDS: Never use "sentiment", "ecosystem", "landscape", "delve", "navigate".',
-          'RULE 6 — JSON ONLY: Respond with valid JSON only. No markdown, no backticks, no extra text.',
-        ].join('\n')
-      : [
-          'You are a crypto journalist. Write clearly — like a reporter, not a content bot.',
-          '1. PLAIN LANGUAGE: Short sentences. Common words. Active voice. No jargon.',
-          '2. WORD COUNT: Minimum 800 words of body text.',
-          '3. META TITLE: Exactly 50-60 characters including spaces.',
-          '4. COIN DISCIPLINE: Only write about coins in the provided market data.',
-          '5. Embed ALL price figures provided. Do not invent numbers.',
-          '6. Include at least 2 internal links from the list provided.',
-          '7. Use 4-6 H2 sections with story-specific headings.',
-          '8. NEVER use: "sentiment", "ecosystem", "landscape", "delve", "navigate", "it is worth noting".',
-          '9. Return ONLY valid JSON — no markdown, no backticks, no extra text.',
-        ].join('\n');
-
-    const publishedAt  = new Date().toISOString();
-    let post: Post;
-
-    // ── Helper: call OpenAI and parse JSON ────────────────────
-    async function callAI(messages: { role: string; content: string }[]): Promise<Record<string, any>> {
-      const response = await openai.chat.completions.create({
-        model,
-        messages: messages as any,
-        temperature,
-        max_completion_tokens: 6000,
-      });
-      const raw   = response.choices[0].message.content || '';
-      const clean = raw.replace(/```json|```/g, '').trim();
-      return JSON.parse(clean);
-    }
-
-    function logPost(p: Post, attempt: 'first' | 'retry'): void {
-      const wordCount = p.content?.replace(/<[^>]+>/g, '').split(/\s+/).filter(Boolean).length ?? 0;
-      console.log(`[aiWorker] ✅ AI post generated (${attempt} attempt):`, {
-        model_used:          model,
-        title:               p.title,
-        slug:                p.slug,
-        category:            p.category,
-        focus_keyword:       p.focus_keyword,
-        word_count:          wordCount,
-        reading_time:        `${p.reading_time_min} min`,
-        meta_title_len:      p.meta_title?.length,
-        meta_desc_len:       p.meta_description?.length,
-        tags_count:          p.tags?.length,
-        has_prices:          /\$[\d,]+(\.\d+)?/.test(p.content || ''),
-        has_int_links:       p.content?.includes('/posts/') ?? false,
-        coins_used:          detectedCoinIds,
-        african_context:     africanContextRelevant,
-      });
-    }
-
-    try {
-      // ── Step 6: First attempt ─────────────────────────────
-      const generated = await callAI([
-        { role: 'system', content: systemPrompt },
-        {
-          role: 'user',
-          content: buildPrompt(
-            msg, category, coinContext, internalLinksStr, hasCoinData, africanContextRelevant,
-          ),
-        },
+      // ── Step 4: Fetch market data + internal links in parallel ─
+      const [coinData, internalLinks] = await Promise.all([
+        fetchCoinData(detectedCoinIds),
+        fetchInternalLinks(category),
       ]);
 
-      post = assemblePost(generated, msg, category, publishedAt, internalLinks);
-      logPost(post, 'first');
+      const coinContext      = formatCoinContext(coinData);
+      const internalLinksStr = formatInternalLinks(internalLinks, siteBaseUrl);
+      console.log(`[aiWorker] 📈 Market + internal links ready (${internalLinks.length} links)`);
 
-      // ── Step 7: Quality check — repair if needed ──────────
-      const firstQuality = checkQuality(post);
-      const publishThreshold = msg.source === 'bot' ? 75 : 80;
+      // ── Step 5: Pick model ────────────────────────────────────
+      const { model, reason } = selectModel(msg.text, category, coinData);
+      console.log(`[aiWorker] 🧠 Model: ${model} (${reason})`);
 
-      if (!firstQuality.passes || firstQuality.score < publishThreshold) {
-        console.log(
-          `[aiWorker] 🔧 First attempt score: ${firstQuality.score}/100 — running repair retry...`,
-        );
-        console.log('[aiWorker] 🔧 Issues to fix:', firstQuality.reasons);
+      const temperature = model === 'gpt-5.4' ? 0.55 : 0.40;
 
-        try {
-          const repaired = await callAI([
-            { role: 'system', content: systemPrompt },
-            {
-              role: 'user',
-              content: buildRepairPrompt(
-                post,
-                firstQuality.reasons,
-                coinContext,
-                internalLinksStr,
-                hasCoinData,
-                siteBaseUrl,
-              ),
-            },
-          ]);
+      const systemPrompt = model === 'gpt-5.4'
+        ? [
+            'You are a senior crypto journalist for a high-authority news platform.',
+            'RULE 1 — PLAIN LANGUAGE: Write clearly. Short words. Short paragraphs. Active voice. No AI jargon.',
+            'RULE 2 — WORD COUNT: Your "content" field must have 800+ words of readable body text.',
+            'RULE 3 — META TITLE: Must be exactly 50-60 characters including spaces.',
+            'RULE 4 — COIN DISCIPLINE: Only write about coins in the provided market data.',
+            'RULE 5 — NO BANNED WORDS: Never use "sentiment", "ecosystem", "landscape", "delve", "navigate".',
+            'RULE 6 — INTERNAL LINKS: Use EXACTLY 2 internal links, copied verbatim from the provided list. No more, no less.',
+            'RULE 7 — JSON ONLY: Respond with valid JSON only. No markdown, no backticks, no extra text.',
+          ].join('\n')
+        : [
+            'You are a crypto journalist. Write clearly — like a reporter, not a content bot.',
+            '1. PLAIN LANGUAGE: Short sentences. Common words. Active voice. No jargon.',
+            '2. WORD COUNT: Minimum 800 words of body text.',
+            '3. META TITLE: Exactly 50-60 characters including spaces.',
+            '4. COIN DISCIPLINE: Only write about coins in the provided market data.',
+            '5. Embed ALL price figures provided. Do not invent numbers.',
+            '6. Include EXACTLY 2 internal links from the list provided. Copy verbatim. No more, no less.',
+            '7. Use 4-6 H2 sections with story-specific headings.',
+            '8. NEVER use: "sentiment", "ecosystem", "landscape", "delve", "navigate", "it is worth noting".',
+            '9. Return ONLY valid JSON — no markdown, no backticks, no extra text.',
+          ].join('\n');
 
-          const repairedPost = assemblePost(repaired, msg, category, publishedAt, internalLinks);
-          const retryQuality = checkQuality(repairedPost);
+      const publishedAt  = new Date().toISOString();
+      let post: Post;
 
-          logPost(repairedPost, 'retry');
-          console.log(
-            `[aiWorker] 🔧 Repair score: ${retryQuality.score}/100 ` +
-            `(was ${firstQuality.score}/100) — ` +
-            (retryQuality.score > firstQuality.score ? '✅ improved' : '⚠️ no improvement, keeping retry anyway'),
-          );
-
-          post = repairedPost;
-
-        } catch (retryErr) {
-          console.warn('[aiWorker] ⚠️ Repair retry failed, keeping first attempt:', retryErr);
-        }
+      // ── Helper: call OpenAI and parse JSON ────────────────────
+      async function callAI(messages: { role: string; content: string }[]): Promise<Record<string, any>> {
+        const response = await openai.chat.completions.create({
+          model,
+          messages: messages as any,
+          temperature,
+          max_completion_tokens: 6000,
+        });
+        const raw   = response.choices[0].message.content || '';
+        const clean = raw.replace(/```json|```/g, '').trim();
+        return JSON.parse(clean);
       }
 
-    } catch (err) {
-      console.error('[aiWorker] ⚠️ AI failed, using fallback:', err);
-      const title = msg.text.split(/[.\n]/)[0].slice(0, 80);
-      post = {
-        title,
-        slug:             slugify(title),
-        content:          `<p>${msg.text}</p>`,
-        excerpt:          msg.text.slice(0, 200),
-        author:           msg.author,
-        tags:             buildTags(undefined, msg.hashtags, category),
-        category,
-        referral_links:   buildReferralLinks(msg.urls),
-        is_published:     false,
-        meta_title:       title.slice(0, 60),
-        meta_description: msg.text.slice(0, 155),
-        focus_keyword:    sanitiseFocusKeyword(msg.hashtags[0] || category),
-        reading_time_min: 1,
-      };
-    }
+      function logPost(p: Post, attempt: 'first' | 'retry'): void {
+        const wordCount = p.content?.replace(/<[^>]+>/g, '').split(/\s+/).filter(Boolean).length ?? 0;
+        // Count real internal links after sanitisation
+        const internalLinkCount = (p.content?.match(/<a\s[^>]*href="[^"]*\/posts\/[^"/?#]+"[^>]*>/gi) || []).length;
+        console.log(`[aiWorker] ✅ AI post generated (${attempt} attempt):`, {
+          model_used:          model,
+          title:               p.title,
+          slug:                p.slug,
+          category:            p.category,
+          focus_keyword:       p.focus_keyword,
+          word_count:          wordCount,
+          reading_time:        `${p.reading_time_min} min`,
+          meta_title_len:      p.meta_title?.length,
+          meta_desc_len:       p.meta_description?.length,
+          tags_count:          p.tags?.length,
+          has_prices:          /\$[\d,]+(\.\d+)?/.test(p.content || ''),
+          internal_link_count: internalLinkCount,
+          coins_used:          detectedCoinIds,
+          african_context:     africanContextRelevant,
+        });
+      }
 
-    // ── Step 8: Final quality gate + publishing decision ─────
-    const quality = checkQuality(post);
-    const publish = shouldPublish(msg.source, quality.score);
-    post.is_published = publish;
+      try {
+        // ── Step 6: First attempt ─────────────────────────────
+        const generated = await callAI([
+          { role: 'system', content: systemPrompt },
+          {
+            role: 'user',
+            content: buildPrompt(
+              msg, category, coinContext, internalLinksStr, hasCoinData, africanContextRelevant,
+            ),
+          },
+        ]);
 
-    const sourceLabel  = msg.source === 'bot' ? 'bot (threshold: 75)' : 'userbot (threshold: 80)';
-    const publishLabel = publish ? '✅ Auto-publishing' : '📝 Saving as draft';
+        post = assemblePost(generated, msg, category, publishedAt, internalLinks);
+        logPost(post, 'first');
 
-    console.log(
-      `[aiWorker] 📊 Quality: ${quality.score}/100 | Source: ${sourceLabel} | ${publishLabel}`,
-    );
+        // ── Step 7: Quality check — repair if needed ──────────
+        const firstQuality = checkQuality(post);
+        const publishThreshold = msg.source === 'bot' ? 75 : 80;
 
-    if (!publish) {
-      console.log('[aiWorker] ⚠️ Quality issues:', quality.reasons);
-    }
+        if (!firstQuality.passes || firstQuality.score < publishThreshold) {
+          console.log(
+            `[aiWorker] 🔧 First attempt score: ${firstQuality.score}/100 — running repair retry...`,
+          );
+          console.log('[aiWorker] 🔧 Issues to fix:', firstQuality.reasons);
+
+          try {
+            const repaired = await callAI([
+              { role: 'system', content: systemPrompt },
+              {
+                role: 'user',
+                content: buildRepairPrompt(
+                  post,
+                  firstQuality.reasons,
+                  coinContext,
+                  internalLinksStr,
+                  hasCoinData,
+                  siteBaseUrl,
+                ),
+              },
+            ]);
+
+            const repairedPost = assemblePost(repaired, msg, category, publishedAt, internalLinks);
+            const retryQuality = checkQuality(repairedPost);
+
+            logPost(repairedPost, 'retry');
+            console.log(
+              `[aiWorker] 🔧 Repair score: ${retryQuality.score}/100 ` +
+              `(was ${firstQuality.score}/100) — ` +
+              (retryQuality.score > firstQuality.score ? '✅ improved' : '⚠️ no improvement, keeping retry anyway'),
+            );
+
+            post = repairedPost;
+
+          } catch (retryErr) {
+            console.warn('[aiWorker] ⚠️ Repair retry failed, keeping first attempt:', retryErr);
+          }
+        }
+
+      } catch (err) {
+        console.error('[aiWorker] ⚠️ AI failed, using fallback:', err);
+        const title = msg.text.split(/[.\n]/)[0].slice(0, 80);
+        post = {
+          title,
+          slug:             slugify(title),
+          content:          `<p>${msg.text}</p>`,
+          excerpt:          msg.text.slice(0, 200),
+          author:           msg.author,
+          tags:             buildTags(undefined, msg.hashtags, category),
+          category,
+          referral_links:   buildReferralLinks(msg.urls),
+          is_published:     false,
+          meta_title:       title.slice(0, 60),
+          meta_description: msg.text.slice(0, 155),
+          focus_keyword:    sanitiseFocusKeyword(msg.hashtags[0] || category),
+          reading_time_min: 1,
+        };
+      }
+
+      // ── Step 8: Final quality gate + publishing decision ─────
+      const quality = checkQuality(post);
+      const publish = shouldPublish(msg.source, quality.score);
+      post.is_published = publish;
+
+      const sourceLabel  = msg.source === 'bot' ? 'bot (threshold: 75)' : 'userbot (threshold: 80)';
+      const publishLabel = publish ? '✅ Auto-publishing' : '📝 Saving as draft';
+
+      console.log(
+        `[aiWorker] 📊 Quality: ${quality.score}/100 | Source: ${sourceLabel} | ${publishLabel}`,
+      );
+
+      if (!publish) {
+        console.log('[aiWorker] ⚠️ Quality issues:', quality.reasons);
+      }
 
       if (publish) {
         await storeQueue.add('store_post', post);
@@ -1238,7 +1300,6 @@ export const aiEnrichWorker = new Worker(
         console.log(`[aiWorker] 📥 → draft queue: ${post.slug}`);
       }
     } finally {
-      // Always release the lock so retries and future messages aren't blocked
       processingLock.delete(fingerprint);
     }
   },

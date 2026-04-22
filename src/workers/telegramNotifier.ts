@@ -2,7 +2,7 @@ import { Worker, Job } from 'bullmq';
 import { redisConnection } from '../queue/queues';
 import { Post } from '../supabase/client';
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
+const BOT_TOKEN      = process.env.TELEGRAM_BOT_TOKEN!;
 const NOTIFY_CHANNEL = process.env.TELEGRAM_NOTIFY_CHANNEL!;
 
 // Exported so aiEnrichWorker can send quick Telegram-only alerts
@@ -13,9 +13,9 @@ export async function sendToChannel(text: string): Promise<void> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      chat_id: NOTIFY_CHANNEL,
+      chat_id:                  NOTIFY_CHANNEL,
       text,
-      parse_mode: 'HTML',
+      parse_mode:               'HTML',
       disable_web_page_preview: false,
     }),
   });
@@ -33,33 +33,50 @@ function extractKeyPoints(content: string): string[] {
     .slice(0, 3);
 }
 
-// This worker ONLY listens to store_post — the queue that only receives
-// published posts. Drafts are routed to draft_post in the AI worker,
-// so they never reach here and never trigger a Telegram notification.
+// ─────────────────────────────────────────────────────────────
+// TELEGRAM NOTIFIER WORKER
+//
+// FIX: Now listens to `notify_post` instead of `store_post`.
+//
+// Previously both this worker and storeWorker consumed the same
+// store_post queue. BullMQ competing consumers meant the
+// notifier could pick up a job before (or in parallel with) the
+// store worker — and always used post.slug from the original
+// payload, which didn't account for the uniqueness suffix that
+// insertPost appends on a 23505 slug conflict.
+//
+// Now the flow is strictly sequential:
+//   store_post → storeWorker → insertPost → notifyQueue → here
+//
+// By the time a job arrives here, the post is already in the DB
+// and post.slug is the resolved slug that was actually saved.
+// ─────────────────────────────────────────────────────────────
 export const telegramNotifier = new Worker(
-  'store_post',
+  'notify_post',                            // ← was 'store_post'
   async (job: Job) => {
     const post: Post = job.data;
 
-    // Secondary guard — defensive check in case queue routing ever changes
+    // Secondary guard — defensive check in case routing changes
     if (!post.is_published) {
       console.warn(
-        `[notifier] ⚠️ Draft reached store_post queue unexpectedly — skipping: "${post.title}"`,
+        `[notifier] ⚠️ Draft reached notify_post queue unexpectedly — skipping: "${post.title}"`,
       );
       return;
     }
 
+    // post.slug is the resolved slug from insertPost — guaranteed
+    // to match the row in the DB, no 404s.
     const siteUrl = (process.env.SITE_URL || 'https://cryptomonieid.com').replace(/\/$/, '');
-    const postUrl = `${siteUrl}/blog/${post.slug}`;
+    const postUrl = `${siteUrl}/posts/${post.slug}`;
 
     const categoryLabel =
-      post.category === 'airdrop' ? 'Airdrop Alert' :
+      post.category === 'airdrop' ? 'Airdrop Alert'  :
       post.category === 'signal'  ? 'Trading Signal' :
       'Crypto News';
 
-    const keyPoints = extractKeyPoints(post.content || '');
+    const keyPoints    = extractKeyPoints(post.content || '');
     const bulletPoints = keyPoints.map(p => `— ${p}`).join('\n');
-    const hashtags = post.tags?.map(t => `#${t.replace(/\s+/g, '')}`).join(' ') || '';
+    const hashtags     = post.tags?.map(t => `#${t.replace(/\s+/g, '')}`).join(' ') || '';
 
     const message = [
       `<b>${categoryLabel}</b>`,
@@ -72,13 +89,13 @@ export const telegramNotifier = new Worker(
       ``,
       `<a href="${postUrl}">Read the full article</a>`,
       ``,
-      `${hashtags}`,
+      hashtags,
       ``,
       `@cryptomoney`,
     ].join('\n');
 
     await sendToChannel(message);
-    console.log(`[notifier] ✅ Posted to Telegram channel: "${post.title}"`);
+    console.log(`[notifier] ✅ Posted to Telegram: "${post.title}" → ${postUrl}`);
   },
   { connection: redisConnection },
 );

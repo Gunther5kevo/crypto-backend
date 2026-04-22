@@ -27,14 +27,20 @@ export const processQueue = new Queue('process_content', {
   defaultJobOptions,
 });
 
-// Published posts → stored to DB + Telegram notification sent
+
 export const storeQueue = new Queue('store_post', {
   connection: redisConnection,
   defaultJobOptions,
 });
 
-// Draft posts → stored to DB only, no Telegram notification
+// Draft posts → stored to DB only, no Telegram notification.
 export const draftQueue = new Queue('draft_post', {
+  connection: redisConnection,
+  defaultJobOptions,
+});
+
+
+export const notifyQueue = new Queue('notify_post', {
   connection: redisConnection,
   defaultJobOptions,
 });

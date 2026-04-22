@@ -20,15 +20,21 @@ function uniqueSlug(base: string): string {
 
 // ─────────────────────────────────────────────────────────────
 // INSERT POST
-// Unchanged logic — the 4 new fields (schema_json_ld,
-// reading_time_min, model_used, ai_quality_score) flow through
-// automatically via the ...post spread. No other changes needed.
+//
+// FIX: Changed return type from Promise<void> to Promise<string>.
+// Returns the slug that was *actually* persisted to the DB.
+//
+// When a 23505 slug conflict occurs, a uniqueness suffix is
+// appended (e.g. "bitcoin-etf-flows-a1b2c"). Previously the
+// caller had no way to know about this, so the Telegram notifier
+// always built its URL from the original slug — producing a 404
+// because the DB row lived at the suffixed slug instead.
 // ─────────────────────────────────────────────────────────────
-export async function insertPost(post: Post): Promise<void> {
+export async function insertPost(post: Post): Promise<string> {
   const baseSlug = post.slug || slugify(post.title);
 
   const payload: Post = {
-    ...post,                              // spreads new fields automatically
+    ...post,
     slug:         baseSlug,
     is_published: post.is_published ?? false,
     views:        0,
@@ -53,4 +59,8 @@ export async function insertPost(post: Post): Promise<void> {
     `score: ${payload.ai_quality_score ?? 'n/a'} | ` +
     `model: ${payload.model_used ?? 'unknown'}`,
   );
+
+  // Return the slug actually written — may differ from post.slug
+  // when a uniqueness suffix was appended on a 23505 retry.
+  return payload.slug;
 }

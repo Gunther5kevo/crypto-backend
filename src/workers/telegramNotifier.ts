@@ -23,9 +23,16 @@ export async function sendToChannel(text: string): Promise<void> {
   if (!data.ok) throw new Error(`Telegram API error: ${JSON.stringify(data)}`);
 }
 
-// Extract 2-3 key bullet points from HTML content
+// Extract 2-3 key bullet points from Markdown content
 function extractKeyPoints(content: string): string[] {
-  const plain = content.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  const plain = content
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/^[-*]\s+/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   return plain
     .split(/(?<=[.!?])\s+/)
     .filter(s => s.length > 40 && s.length < 180)
@@ -67,7 +74,7 @@ export const telegramNotifier = new Worker(
     // post.slug is the resolved slug from insertPost — guaranteed
     // to match the row in the DB, no 404s.
     const siteUrl = (process.env.SITE_URL || 'https://cryptomonieid.com').replace(/\/$/, '');
-    const postUrl = `${siteUrl}/posts/${post.slug}`;
+    const postUrl = `${siteUrl}/blog/${post.slug}`;
 
     const categoryLabel =
       post.category === 'airdrop' ? 'Airdrop Alert'  :

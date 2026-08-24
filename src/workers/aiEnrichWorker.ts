@@ -100,7 +100,7 @@ async function isDuplicate(text: string, title: string): Promise<boolean> {
 
     const { data: recentPosts, error } = await supabase
       .from('posts')
-      .select('title, excerpt')
+      .select('title, excerpt, content')
       .gte('created_at', since)
       .order('created_at', { ascending: false })
       .limit(50);
@@ -122,12 +122,16 @@ async function isDuplicate(text: string, title: string): Promise<boolean> {
 
     if (!keywords.length) return false;
 
+    // Match against the full stored article, not just the excerpt — a short
+    // source message (Telegram-style, terse) rarely shares 60%+ of its words
+    // with a 200-char excerpt even when it's the same story reworded by a
+    // different channel, but it does show up against the full ~800-word body.
     for (const post of recentPosts) {
-      const existing = `${post.title} ${post.excerpt}`.toLowerCase();
+      const existing = `${post.title} ${post.excerpt} ${post.content}`.toLowerCase();
       const matchCount = keywords.filter(kw => existing.includes(kw)).length;
       const overlap = matchCount / keywords.length;
 
-      if (overlap > 0.6) {
+      if (overlap > 0.45) {
         console.log(`[aiWorker] 🔁 Duplicate detected (${Math.round(overlap * 100)}% overlap) with: "${post.title}"`);
         return true;
       }
@@ -428,14 +432,14 @@ async function fetchInternalLinks(category: string): Promise<InternalLink[]> {
 function formatInternalLinks(links: InternalLink[], siteBaseUrl: string): string {
   if (!links.length) return 'No internal links available yet.';
   return links
-    .map(l => `<a href="${siteBaseUrl}/posts/${l.slug}">${l.title}</a>`)
+    .map(l => `[${l.title}](${siteBaseUrl}/blog/${l.slug})`)
     .join('\n');
 }
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 9 — SCHEMA.ORG JSON-LD GENERATOR
 // ─────────────────────────────────────────────────────────────
-function buildSchemaJsonLd(post: Post, publishedAt: string): string {
+function buildSchemaJsonLd(post: Post, publishedAt: string, siteBaseUrl: string): string {
   const schema = {
     '@context': 'https://schema.org',
     '@type': 'NewsArticle',
@@ -445,14 +449,14 @@ function buildSchemaJsonLd(post: Post, publishedAt: string): string {
     author: { '@type': 'Person', name: post.author },
     publisher: {
       '@type': 'Organization',
-      name: 'YourCryptoSite',
-      logo: { '@type': 'ImageObject', url: 'https://yourcryptosite.com/logo.png' },
+      name: process.env.SITE_NAME || 'CryptoMoney',
+      logo: { '@type': 'ImageObject', url: `${siteBaseUrl}/logo.png` },
     },
     datePublished: publishedAt,
     dateModified: publishedAt,
     mainEntityOfPage: {
       '@type': 'WebPage',
-      '@id': `https://yourcryptosite.com/posts/${post.slug}`,
+      '@id': `${siteBaseUrl}/blog/${post.slug}`,
     },
     articleSection: post.category,
   };
@@ -460,10 +464,29 @@ function buildSchemaJsonLd(post: Post, publishedAt: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────
+// SECTION 9b — MARKDOWN PLAIN-TEXT HELPER
+// Strips Markdown syntax (headings, emphasis, links, bullets) down
+// to readable prose, used for word counts / keyword density / the
+// Telegram excerpt. Content is Markdown from Section 13 onward.
+// ─────────────────────────────────────────────────────────────
+function stripMarkdown(md: string): string {
+  return (md || '')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/_([^_]+)_/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/^[-*]\s+/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ─────────────────────────────────────────────────────────────
 // SECTION 10 — READING TIME ESTIMATOR
 // ─────────────────────────────────────────────────────────────
 function estimateReadingTime(content: string): number {
-  const wordCount = content.replace(/<[^>]+>/g, '').split(/\s+/).filter(Boolean).length;
+  const wordCount = stripMarkdown(content).split(/\s+/).filter(Boolean).length;
   return Math.max(1, Math.ceil(wordCount / 200));
 }
 
@@ -476,11 +499,35 @@ interface QualityResult {
   reasons: string[];
 }
 
+// Multi-word AI/SEO jargon that must never survive into published
+// content. Checked as a hard gate below — a post can score 100/100
+// on every other metric and still get sent back for repair if any
+// of these phrases are present.
+const AI_JARGON_PHRASES = [
+  'it is worth noting', 'it remains to be seen', 'in the ever-evolving',
+  'the crypto space', 'as we know', 'needless to say', 'at the end of the day',
+  'in the world of crypto', 'at the time of writing', 'game-changing',
+  'game changer', 'paradigm', 'groundbreaking', 'revolutionary',
+  'transformative', 'pioneering', 'cutting-edge', 'holistic', 'robust',
+  'synergy', 'ecosystem', 'landscape', 'navigate', 'dive into', 'delve',
+  'empower', 'unlock', 'sentiment', 'significant implications',
+  'it is important to note', 'this is a developing story',
+  'time will tell', 'only time will tell', 'interesting to see',
+];
+
+function findBannedPhrases(plainText: string): string[] {
+  const lower = plainText.toLowerCase();
+  return AI_JARGON_PHRASES.filter(phrase => {
+    const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`\\b${escaped}\\b`, 'i').test(lower);
+  });
+}
+
 function checkQuality(post: Post): QualityResult {
   const reasons: string[] = [];
   let score = 0;
 
-  const plainText  = post.content?.replace(/<[^>]+>/g, '') || '';
+  const plainText  = stripMarkdown(post.content || '');
   const wordCount  = plainText.split(/\s+/).filter(Boolean).length;
   const sentences  = plainText.split(/[.!?]+/).filter(s => s.trim().length > 10);
   const fullKeyword = post.focus_keyword?.toLowerCase().trim() || '';
@@ -554,7 +601,7 @@ function checkQuality(post: Post): QualityResult {
   }
 
   // 8. H2 headings — at least 3 (5 pts)
-  const h2Count = (post.content?.match(/<h2>/gi) || []).length;
+  const h2Count = (post.content?.match(/^##\s+/gm) || []).length;
   if (h2Count >= 3) {
     score += 5;
   } else {
@@ -569,14 +616,22 @@ function checkQuality(post: Post): QualityResult {
   }
 
   // 10. Internal links present (10 pts)
-  const hasInternalLinks = post.content?.includes('/posts/') ?? false;
+  const hasInternalLinks = post.content?.includes('/blog/') ?? false;
   if (hasInternalLinks) {
     score += 10;
   } else {
     reasons.push('No internal links found in content');
   }
 
-  return { passes: score >= 75, score, reasons };
+  // 11. No AI/SEO jargon anywhere in the body (hard gate — not scored,
+  // just blocks publishing outright since one leftover phrase can't be
+  // offset by a good score elsewhere)
+  const bannedFound = findBannedPhrases(plainText);
+  if (bannedFound.length > 0) {
+    reasons.push(`Banned AI phrases found: ${bannedFound.join(', ')}`);
+  }
+
+  return { passes: score >= 75 && bannedFound.length === 0, score, reasons };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -609,8 +664,6 @@ function buildPrompt(
   hasCoinData: boolean,
   africanContextRelevant: boolean,
 ): string {
-  const siteBaseUrl = process.env.SITE_BASE_URL || 'https://yourcryptosite.com';
-
   const coinInstructions = hasCoinData
     ? `
 ════════════════════════════════════════════
@@ -689,7 +742,7 @@ ${africanBlock}
 INTERNAL LINKS — CRITICAL RULES
 ════════════════════════════════════════════
 You MUST use EXACTLY 2 internal links from the list below.
-Copy the full <a href="...">...</a> tag VERBATIM — do NOT modify the href or anchor text.
+Copy the full [anchor text](url) Markdown link VERBATIM — do NOT modify the url or anchor text.
 Do NOT invent, guess, or construct any link that is not in the list below.
 Do NOT add a third internal link. Exactly 2. No more, no less.
 
@@ -698,7 +751,7 @@ ${internalLinks}
 CHECKLIST before finishing:
 ✓ Did you copy exactly 2 links from the list above?
 ✓ Are both hrefs exactly as shown — not modified, not invented?
-✓ Are there NO extra /posts/ links beyond these 2?
+✓ Are there NO extra /blog/ links beyond these 2?
 
 ════════════════════════════════════════════
 CONTENT STRUCTURE
@@ -714,12 +767,14 @@ Each section needs at least 2-3 substantial paragraphs. No one-liners.
 Use specific numbers and data throughout — percentages, dates, dollar figures.
 
 End the article with:
-<p><em>Disclaimer: This content is for informational purposes only and does not constitute financial advice. Always do your own research before investing.</em></p>
+*Disclaimer: This content is for informational purposes only and does not constitute financial advice. Always do your own research before investing.*
 
 ════════════════════════════════════════════
 BANNED WORDS — NEVER USE THESE ANYWHERE
 ════════════════════════════════════════════
-These words make writing sound like a robot. Remove them at every turn:
+These words make writing sound like a robot. This is enforced automatically —
+any of these phrases in the final content will fail the quality gate and
+force a rewrite. Remove them at every turn:
 
 AI jargon to kill:
 "it is worth noting", "it remains to be seen", "in the ever-evolving",
@@ -740,8 +795,10 @@ Filler phrases to kill:
 "time will tell", "only time will tell", "interesting to see"
 
 ════════════════════════════════════════════
-HTML: Use only <h2>, <p>, <ul>, <li>, <strong>, <em>, <a href="...">.
-Do NOT use: <h1>, <h3>, <div>, <span>, <br>, <table>, or anything else.
+FORMAT: Write the "content" field as Markdown.
+Use only: "## " for section headings, blank-line-separated paragraphs,
+"- " for bullet lists, **bold**, *italic*, and [anchor text](url) for links.
+Do NOT use: "# " (H1), "### " (H3+), raw HTML tags, tables, or code blocks.
 
 ════════════════════════════════════════════
 SEO FIELDS
@@ -790,11 +847,13 @@ Only write JSON after all 7 checks pass.
 
 ════════════════════════════════════════════
 OUTPUT: VALID JSON ONLY
-No markdown. No backticks. No text before or after. Escape all HTML inside JSON strings.
+Return raw JSON — no code fences, no backticks, no text before or after
+the JSON object. "content" holds Markdown text (see FORMAT above); escape
+newlines and quotes properly so the JSON itself stays valid.
 
 {
   "title": "60-80 chars, contains focus_keyword, specific and click-worthy",
-  "content": "<h2>...</h2><p>...</p>... — minimum 800 words of body text",
+  "content": "## Heading\n\nParagraph text...\n\n## Another Heading\n\nMore text... — minimum 800 words of body text",
   "excerpt": "150-200 chars, focus_keyword + one specific data point",
   "meta_title": "EXACTLY 50-60 chars",
   "meta_description": "EXACTLY 120-160 chars",
@@ -815,7 +874,7 @@ function buildRepairPrompt(
   hasCoinData: boolean,
   siteBaseUrl: string,
 ): string {
-  const plainText  = draft.content?.replace(/<[^>]+>/g, '') || '';
+  const plainText  = stripMarkdown(draft.content || '');
   const wordCount  = plainText.split(/\s+/).filter(Boolean).length;
   const keyword    = draft.focus_keyword || '';
   const escaped    = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -863,14 +922,23 @@ function buildRepairPrompt(
 
   if (reasons.some(r => r.includes('internal links'))) {
     fixes.push(
-      `INTERNAL LINKS: No internal links found. Copy EXACTLY 2 of these complete anchor tags VERBATIM into your content:\n` +
+      `INTERNAL LINKS: No internal links found. Copy EXACTLY 2 of these complete Markdown links VERBATIM into your content:\n` +
       `${internalLinks}\n` +
-      `DO NOT modify the href. DO NOT invent links not in this list. Use exactly 2 — not 1, not 3.`,
+      `DO NOT modify the url. DO NOT invent links not in this list. Use exactly 2 — not 1, not 3.`,
     );
   }
 
   if (reasons.some(r => r.includes('H2'))) {
-    fixes.push(`H2 HEADINGS: Add more H2 sections until you have at least 3.`);
+    fixes.push(`H2 HEADINGS: Add more "## " section headings until you have at least 3.`);
+  }
+
+  const bannedReason = reasons.find(r => r.startsWith('Banned AI phrases found'));
+  if (bannedReason) {
+    const found = bannedReason.replace('Banned AI phrases found: ', '');
+    fixes.push(
+      `BANNED PHRASES: These AI-sounding phrases appear in your draft and must be removed entirely: ${found}. ` +
+      `Don't just delete the phrase — rewrite the sentence around it in plain, direct language.`,
+    );
   }
 
   const coinBlock = hasCoinData
@@ -908,39 +976,53 @@ ${JSON.stringify({
   }, null, 2)}
 
 ════════════════════════════════════════════
-OUTPUT: VALID JSON ONLY. No markdown. No backticks. No extra text.
-Same schema: title, content, excerpt, meta_title, meta_description, focus_keyword, tags.
+OUTPUT: VALID JSON ONLY. No code fences. No backticks. No extra text.
+"content" stays Markdown. Same schema: title, content, excerpt, meta_title,
+meta_description, focus_keyword, tags.
 `.trim();
 }
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 13b2 — INTERNAL LINK SANITISER
-// Strips every <a> tag whose href is NOT an exact allowed /posts/slug.
-// This catches: invented slugs, external URLs the AI made up,
-// /blog/... paths, and any other non-approved anchor.
+// Strips every Markdown [text](url) link whose url is NOT an exact
+// allowed /blog/slug. This catches: invented slugs, external URLs
+// the AI made up, /posts/... paths (the frontend has no route for
+// those), and any other non-approved link. Also strips any raw
+// <a href> HTML the model leaked despite the Markdown-only
+// instruction — content should never contain HTML, and an
+// unrendered tag is exactly the kind of "link to nowhere" this
+// function exists to prevent.
 // ─────────────────────────────────────────────────────────────
 function sanitiseInternalLinks(content: string, allowedLinks: InternalLink[]): string {
   const allowedSlugs = new Set(allowedLinks.map(l => l.slug));
 
-  // Match ALL anchor tags regardless of href format
-  return content.replace(
-    /<a\s[^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/gi,
-    (_match, href, anchorText) => {
-      // Only keep links that are exact /posts/{slug} matches in the allowed set
-      const internalMatch = href.match(/\/posts\/([^"/?#]+)/);
+  const mdSanitised = content.replace(
+    /\[([^\]]+)\]\(([^)]*)\)/g,
+    (_match, anchorText, href) => {
+      // Only keep links that are exact /blog/{slug} matches in the allowed set
+      const internalMatch = href.match(/\/blog\/([^)/?#]+)/);
       if (internalMatch && allowedSlugs.has(internalMatch[1])) {
         return _match; // Legitimate — keep exactly as-is
       }
-      // Everything else: invented slugs, external links, /blog/... etc.
+      // Everything else: invented slugs, external links, /posts/... etc.
       console.log(`[aiWorker] 🔗 Removed invented/external link: ${href}`);
-      return anchorText; // Strip tag, keep readable text
+      return anchorText; // Strip link, keep readable text
+    },
+  );
+
+  // Defense in depth: strip any stray raw HTML anchors too
+  return mdSanitised.replace(
+    /<a\s[^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/gi,
+    (_match, href, anchorText) => {
+      console.log(`[aiWorker] 🔗 Removed stray HTML anchor: ${href}`);
+      return anchorText;
     },
   );
 }
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 13b3 — INTERNAL LINK CAP
-// Hard-caps the number of internal /posts/ links to `max`.
+// Hard-caps the number of internal /blog/ links to `max`.
 // Runs after sanitiseInternalLinks so only real slugs remain.
 // ─────────────────────────────────────────────────────────────
 function capInternalLinks(
@@ -952,12 +1034,12 @@ function capInternalLinks(
   let count = 0;
 
   return content.replace(
-    /<a\s[^>]*href="[^"]*\/posts\/([^"/?#]+)"[^>]*>(.*?)<\/a>/gi,
-    (_match, slug, anchorText) => {
+    /\[([^\]]+)\]\([^)]*\/blog\/([^)/?#]+)\)/g,
+    (_match, anchorText, slug) => {
       if (!allowedSlugs.has(slug)) return anchorText; // Shouldn't happen after sanitise, safety net
       count++;
       if (count <= max) return _match; // Within cap — keep
-      console.log(`[aiWorker] 🔗 Removed excess internal link (${count}/${max}): /posts/${slug}`);
+      console.log(`[aiWorker] 🔗 Removed excess internal link (${count}/${max}): /blog/${slug}`);
       return anchorText; // Over cap — strip link, keep text
     },
   );
@@ -972,6 +1054,7 @@ function assemblePost(
   category: string,
   publishedAt: string,
   internalLinks: InternalLink[],
+  siteBaseUrl: string,
 ): Post {
   const sanitised = { ...generated };
   sanitised.focus_keyword = sanitiseFocusKeyword(sanitised.focus_keyword || '');
@@ -1000,23 +1083,31 @@ function assemblePost(
     reading_time_min: estimateReadingTime(sanitised.content),
   };
 
-  post.schema_json_ld = buildSchemaJsonLd(post, publishedAt);
+  post.schema_json_ld = buildSchemaJsonLd(post, publishedAt, siteBaseUrl);
   return post;
 }
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 14 — HYBRID MODEL SELECTOR
 // ─────────────────────────────────────────────────────────────
+// Kept deliberately short — only genuinely rare, high-impact events.
+// Routine mentions of exchanges, tickers, or ongoing geopolitical topics
+// (binance, usdt, iran, war, trump, ...) used to live here and matched on
+// almost every news item these channels post, pushing the bulk of ordinary
+// content onto the expensive model for no real accuracy gain. The 24h/7d
+// price-move check below already catches genuine market shocks numerically.
 const BREAKING_NEWS_KEYWORDS = [
-  'sec', 'etf', 'approved', 'banned', 'hack', 'exploit', 'crashed',
-  'rug pull', 'bankrupt', 'lawsuit', 'regulation', 'federal reserve',
-  'interest rate', 'inflation', 'blackrock', 'fidelity', 'coinbase',
-  'binance', 'tether', 'usdt', 'stablecoin', 'depegged', 'listing',
-  'delisting', 'halving', 'upgrade', 'fork', 'mainnet',
-  'iran', 'russia', 'china ban', 'war', 'sanctions', 'military',
-  'attack', 'conflict', 'tariff', 'trump', 'fed chair', 'treasury',
-  'executive order', 'nato', 'israel', 'taiwan', 'north korea',
+  'sec charges', 'sec lawsuit', 'etf approved', 'etf rejected', 'etf denied',
+  'hack', 'exploit', 'rug pull', 'bankrupt', 'bankruptcy', 'lawsuit',
+  'depegged', 'halving', 'banned', 'sanctions', 'war', 'executive order',
 ];
+
+function matchesBreakingKeyword(lower: string): boolean {
+  return BREAKING_NEWS_KEYWORDS.some(kw => {
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`\\b${escaped}\\b`, 'i').test(lower);
+  });
+}
 
 function selectModel(
   text: string,
@@ -1041,9 +1132,8 @@ function selectModel(
     };
   }
 
-  const isBreaking = BREAKING_NEWS_KEYWORDS.some(kw => lower.includes(kw));
-  if (isBreaking) {
-    return { model: 'gpt-5.4', reason: 'breaking/geopolitical news keyword detected' };
+  if (matchesBreakingKeyword(lower)) {
+    return { model: 'gpt-5.4', reason: 'breaking news keyword detected' };
   }
 
   return { model: 'gpt-5.4-mini', reason: 'routine content — cost optimised' };
@@ -1118,7 +1208,7 @@ export const aiEnrichWorker = new Worker(
           : `[aiWorker] 🪙 No coins detected — skipping price fetch`,
       );
 
-      const siteBaseUrl = process.env.SITE_BASE_URL || 'https://yourcryptosite.com';
+      const siteBaseUrl = process.env.SITE_URL || 'https://cryptomonieid.com';
 
       // ── Step 4: Fetch market data + internal links in parallel ─
       const [coinData, internalLinks] = await Promise.all([
@@ -1210,7 +1300,7 @@ export const aiEnrichWorker = new Worker(
           },
         ]);
 
-        post = assemblePost(generated, msg, category, publishedAt, internalLinks);
+        post = assemblePost(generated, msg, category, publishedAt, internalLinks, siteBaseUrl);
         logPost(post, 'first');
 
         // ── Step 7: Quality check — repair if needed ──────────
@@ -1239,7 +1329,7 @@ export const aiEnrichWorker = new Worker(
               },
             ]);
 
-            const repairedPost = assemblePost(repaired, msg, category, publishedAt, internalLinks);
+            const repairedPost = assemblePost(repaired, msg, category, publishedAt, internalLinks, siteBaseUrl);
             const retryQuality = checkQuality(repairedPost);
 
             logPost(repairedPost, 'retry');
@@ -1262,7 +1352,7 @@ export const aiEnrichWorker = new Worker(
         post = {
           title,
           slug:             slugify(title),
-          content:          `<p>${msg.text}</p>`,
+          content:          msg.text,
           excerpt:          msg.text.slice(0, 200),
           author:           msg.author,
           tags:             buildTags(undefined, msg.hashtags, category),

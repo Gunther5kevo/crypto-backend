@@ -16,6 +16,18 @@ function shouldBlog(text: string): boolean {
 
   if (wordCount < 10) return false;
 
+  // ── Low-information repetition (e.g. "Hello Hello Hello ...") ─
+  const tokens = lower.split(/\s+/).map(w => w.replace(/[^\p{L}\p{N}]/gu, '')).filter(Boolean);
+  const tokenFreq = new Map<string, number>();
+  for (const t of tokens) tokenFreq.set(t, (tokenFreq.get(t) ?? 0) + 1);
+  const topTokenCount = Math.max(0, ...tokenFreq.values());
+  const uniqueRatio = tokenFreq.size / tokens.length;
+  if (topTokenCount / tokens.length > 0.4 || uniqueRatio < 0.35) {
+    const preview = text.slice(0, 80).replace(/\n/g, ' ');
+    console.log(`[aiWorker] 🚫 Low-information repetition — skipping: "${preview}"`);
+    return false;
+  }
+
   // ── Price ticker lines ───────────────────────────────────────
   const priceTicker = /^[a-z\s/]+:\s*\$[\d,]+(\.\d+)?\s*[▲▼]?\s*[\d.]+%\s*$/i;
   if (priceTicker.test(lower)) return false;

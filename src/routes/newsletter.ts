@@ -33,6 +33,24 @@ function buildUnsubscribeUrl(email: string): string {
   return `${base}/api/newsletter/unsubscribe?email=${encodeURIComponent(email)}&token=${token}`;
 }
 
+// From header with a display name — bare addresses read as less legitimate to
+// both inboxes and spam filters.
+function getFromHeader(): string {
+  const name  = process.env.SITE_NAME ?? 'CryptoMoney';
+  const email = process.env.RESEND_FROM_EMAIL ?? 'newsletter@yourdomain.com';
+  return `${name} <${email}>`;
+}
+
+// RFC 2369 + RFC 8058 one-click unsubscribe headers. Gmail/Yahoo expect these
+// on bulk mail — without them, recipients hit "report spam" instead of the
+// unsubscribe link, which hurts sender reputation.
+function getListUnsubscribeHeaders(unsubscribeLink: string): Record<string, string> {
+  return {
+    'List-Unsubscribe': `<${unsubscribeLink}>`,
+    'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+  };
+}
+
 // ─── POST /subscribe ──────────────────────────────────────────────────────────
 
 router.post('/subscribe', async (req, res) => {
@@ -75,18 +93,17 @@ router.post('/subscribe', async (req, res) => {
   return res.status(200).json({ message: "You've been subscribed to our newsletter." });
 });
 
-// ─── GET /unsubscribe ─────────────────────────────────────────────────────────
+// ─── Unsubscribe (GET for the link in the email body, POST for RFC 8058 ───────
+// one-click unsubscribe, which mail clients call automatically without a
+// redirect) ─────────────────────────────────────────────────────────────────
 
-router.get('/unsubscribe', async (req, res) => {
-  const { email, token } = req.query as { email?: string; token?: string };
-
-  if (!email || !token) {
-    return res.status(400).send('Missing email or token.');
-  }
-
+async function deactivateSubscriber(
+  email: string,
+  token: string
+): Promise<{ ok: true } | { ok: false; status: number; message: string }> {
   const expected = makeUnsubscribeToken(email);
   if (token !== expected) {
-    return res.status(403).send('Invalid or expired unsubscribe link.');
+    return { ok: false, status: 403, message: 'Invalid or expired unsubscribe link.' };
   }
 
   const supabase = getSupabase();
@@ -97,11 +114,41 @@ router.get('/unsubscribe', async (req, res) => {
 
   if (error) {
     console.error('[newsletter] Unsubscribe DB error:', error);
-    return res.status(500).send('Something went wrong. Please try again later.');
+    return { ok: false, status: 500, message: 'Something went wrong. Please try again later.' };
+  }
+
+  return { ok: true };
+}
+
+router.get('/unsubscribe', async (req, res) => {
+  const { email, token } = req.query as { email?: string; token?: string };
+
+  if (!email || !token) {
+    return res.status(400).send('Missing email or token.');
+  }
+
+  const result = await deactivateSubscriber(email, token);
+  if (result.ok === false) {
+    return res.status(result.status).send(result.message);
   }
 
   const frontendBase = (process.env.FRONTEND_URL ?? 'http://localhost:8080').replace(/\/$/, '');
   return res.redirect(`${frontendBase}/newsletter?unsubscribed=true`);
+});
+
+router.post('/unsubscribe', async (req, res) => {
+  const { email, token } = req.query as { email?: string; token?: string };
+
+  if (!email || !token) {
+    return res.status(400).json({ error: 'Missing email or token.' });
+  }
+
+  const result = await deactivateSubscriber(email, token);
+  if (result.ok === false) {
+    return res.status(result.status).json({ error: result.message });
+  }
+
+  return res.status(200).json({ ok: true });
 });
 
 // ─── GET /blast/stats ─────────────────────────────────────────────────────────
@@ -184,18 +231,17 @@ router.post('/blast', async (req, res) => {
   for (let i = 0; i < allEmails.length; i += BATCH_SIZE) {
     const batch = allEmails.slice(i, i + BATCH_SIZE);
 
-    const emails = batch.map((email) => ({
-      from:    process.env.RESEND_FROM_EMAIL ?? 'newsletter@yourdomain.com',
-      to:      email,
-      subject: postTitle,
-      html:    buildBlastHtml({
-        postSlug,
-        postTitle,
-        postExcerpt,
-        postCategory,
-        unsubscribeLink: buildUnsubscribeUrl(email),
-      }),
-    }));
+    const emails = batch.map((email) => {
+      const unsubscribeLink = buildUnsubscribeUrl(email);
+      return {
+        from:    getFromHeader(),
+        to:      email,
+        subject: postTitle,
+        html:    buildBlastHtml({ postSlug, postTitle, postExcerpt, postCategory, unsubscribeLink }),
+        text:    buildBlastText({ postSlug, postTitle, postExcerpt, postCategory, unsubscribeLink }),
+        headers: getListUnsubscribeHeaders(unsubscribeLink),
+      };
+    });
 
     try {
       await resend.batch.send(emails);
@@ -230,10 +276,12 @@ async function sendWelcomeEmail(to: string, isResubscribe: boolean) {
   const unsubscribeLink = buildUnsubscribeUrl(to);
 
   await getResend().emails.send({
-    from:    process.env.RESEND_FROM_EMAIL ?? 'newsletter@yourdomain.com',
+    from:    getFromHeader(),
     to,
     subject: isResubscribe ? 'Welcome back to the newsletter' : 'Subscription confirmed',
     html:    buildWelcomeHtml({ to, isResubscribe, unsubscribeLink }),
+    text:    buildWelcomeText({ isResubscribe, unsubscribeLink }),
+    headers: getListUnsubscribeHeaders(unsubscribeLink),
   });
 }
 
@@ -249,6 +297,7 @@ export function buildWelcomeHtml({
   const siteUrl  = (process.env.FRONTEND_URL ?? 'http://localhost:8080').replace(/\/$/, '');
   const siteName = process.env.SITE_NAME ?? 'CryptoMoney';
   const siteHost = siteUrl.replace(/https?:\/\//, '');
+  const postalAddress = process.env.SITE_POSTAL_ADDRESS ?? '';
 
   const headline = isResubscribe ? 'Welcome back.' : 'Subscription confirmed.';
   const subhead  = isResubscribe
@@ -408,7 +457,7 @@ export function buildWelcomeHtml({
           style="max-width: 560px; margin-top: 16px;">
           <tr>
             <td style="text-align: center; font-size: 11px; color: #3d4254; padding: 0 16px;">
-              &copy; ${new Date().getFullYear()} ${siteName}. All rights reserved.
+              &copy; ${new Date().getFullYear()} ${siteName}. All rights reserved.${postalAddress ? `<br />${postalAddress}` : ''}
             </td>
           </tr>
         </table>
@@ -420,6 +469,39 @@ export function buildWelcomeHtml({
 </body>
 </html>
   `.trim();
+}
+
+// ─── Welcome email plain-text alternative ────────────────────────────────────
+
+function buildWelcomeText({
+  isResubscribe,
+  unsubscribeLink,
+}: {
+  isResubscribe: boolean;
+  unsubscribeLink: string;
+}): string {
+  const siteUrl  = (process.env.FRONTEND_URL ?? 'http://localhost:8080').replace(/\/$/, '');
+  const siteName = process.env.SITE_NAME ?? 'CryptoMoney';
+  const postalAddress = process.env.SITE_POSTAL_ADDRESS ?? '';
+
+  const headline = isResubscribe ? 'Welcome back.' : 'Subscription confirmed.';
+  const bodyText = isResubscribe
+    ? `Your subscription has been reactivated. You'll continue receiving our weekly market analysis, security intelligence, and curated insights from across the crypto space.`
+    : `Each week you'll receive a focused briefing covering market analysis, security intelligence, and platform updates. No noise. No spam. Unsubscribe any time.`;
+
+  return [
+    headline,
+    '',
+    bodyText,
+    '',
+    `Visit ${siteName}: ${siteUrl}`,
+    '',
+    '---',
+    `You received this email because you subscribed at ${siteUrl}. We will never share your address with third parties.`,
+    `Unsubscribe: ${unsubscribeLink}`,
+    '',
+    `${siteName}${postalAddress ? ` — ${postalAddress}` : ''}`,
+  ].join('\n');
 }
 
 // ─── Blast email HTML ─────────────────────────────────────────────────────────
@@ -440,6 +522,7 @@ function buildBlastHtml({
   const siteUrl      = (process.env.FRONTEND_URL ?? 'http://localhost:8080').replace(/\/$/, '');
   const siteName     = process.env.SITE_NAME ?? 'CryptoMoney';
   const siteHost     = siteUrl.replace(/https?:\/\//, '');
+  const postalAddress = process.env.SITE_POSTAL_ADDRESS ?? '';
   const postUrl      = `${siteUrl}/blog/${postSlug}`;
   const categoryLabel = postCategory
     ? postCategory.charAt(0).toUpperCase() + postCategory.slice(1)
@@ -570,7 +653,7 @@ function buildBlastHtml({
           style="max-width: 560px; margin-top: 16px;">
           <tr>
             <td style="text-align: center; font-size: 11px; color: #3d4254; padding: 0 16px;">
-              &copy; ${new Date().getFullYear()} ${siteName}. All rights reserved.
+              &copy; ${new Date().getFullYear()} ${siteName}. All rights reserved.${postalAddress ? `<br />${postalAddress}` : ''}
             </td>
           </tr>
         </table>
@@ -582,6 +665,44 @@ function buildBlastHtml({
 </body>
 </html>
   `.trim();
+}
+
+// ─── Blast email plain-text alternative ──────────────────────────────────────
+
+function buildBlastText({
+  postSlug,
+  postTitle,
+  postExcerpt,
+  postCategory,
+  unsubscribeLink,
+}: {
+  postSlug:        string;
+  postTitle:       string;
+  postExcerpt:     string;
+  postCategory?:   string;
+  unsubscribeLink: string;
+}): string {
+  const siteUrl  = (process.env.FRONTEND_URL ?? 'http://localhost:8080').replace(/\/$/, '');
+  const siteName = process.env.SITE_NAME ?? 'CryptoMoney';
+  const postalAddress = process.env.SITE_POSTAL_ADDRESS ?? '';
+  const postUrl  = `${siteUrl}/blog/${postSlug}`;
+  const categoryLabel = postCategory
+    ? postCategory.charAt(0).toUpperCase() + postCategory.slice(1)
+    : 'Analysis';
+
+  return [
+    `[${categoryLabel}] ${postTitle}`,
+    '',
+    postExcerpt,
+    '',
+    `Read the full article: ${postUrl}`,
+    '',
+    '---',
+    `You received this because you subscribed at ${siteUrl}. We will never share your address with third parties.`,
+    `Unsubscribe: ${unsubscribeLink}`,
+    '',
+    `${siteName}${postalAddress ? ` — ${postalAddress}` : ''}`,
+  ].join('\n');
 }
 
 export { router as newsletterRouter };

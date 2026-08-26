@@ -4,6 +4,7 @@ import { redisConnection, storeQueue, draftQueue } from '../queue/queues';
 import { NormalizedMessage } from '../types/message';
 import { Post, ReferralLink } from '../supabase/client';
 import { supabase } from '../supabase/client';
+import { isCryptoRelevant } from '../filters/cryptoRelevance';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -1177,10 +1178,12 @@ export const aiEnrichWorker = new Worker(
       const preview = msg.text.slice(0, 80).replace(/\n/g, ' ');
       console.log(`[aiWorker] ⚡ Skipping blog from ${msg.author} — filtered. Preview: "${preview}"`);
 
-      if (msg.text.trim().length > 0) {
+      if (isCryptoRelevant(msg.text)) {
         const { sendToChannel } = await import('../workers/telegramNotifier');
         const formatted = formatTelegramQuickUpdate(msg.text, msg.author);
         await sendToChannel(formatted);
+      } else {
+        console.log(`[aiWorker] 🚫 Not crypto-relevant — no Telegram alert sent. Preview: "${preview}"`);
       }
       return;
     }

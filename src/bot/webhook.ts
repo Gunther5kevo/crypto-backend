@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { NormalizedMessage } from '../types/message';
 import { ingestQueue } from '../queue/queues';
+import { isCryptoRelevant } from '../filters/cryptoRelevance';
 
 export const botRouter = Router();
 
@@ -60,6 +61,14 @@ botRouter.post('/webhook/telegram', async (req: Request, res: Response) => {
   // Duplicate filter
   if (isDuplicate(message.text)) {
     console.log('[bot] ⚠️ Duplicate skipped:', message.text.slice(0, 50));
+    return res.status(200).json({ ok: true });
+  }
+
+  // Crypto relevance filter — this bot only handles crypto content,
+  // so a contact DMing small talk or an off-topic message never
+  // reaches the queue (and therefore never reaches Telegram output).
+  if (!isCryptoRelevant(message.text)) {
+    console.log('[bot] 🚫 Not crypto-relevant, skipped:', message.text.slice(0, 50));
     return res.status(200).json({ ok: true });
   }
 

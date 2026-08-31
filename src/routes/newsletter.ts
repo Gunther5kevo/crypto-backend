@@ -173,21 +173,34 @@ router.get('/blast/stats', async (_req, res) => {
 // ─── POST /blast ──────────────────────────────────────────────────────────────
 // Fetches all active subscribers in pages of 500 and sends via Resend batch API.
 // Resend batch allows up to 100 emails per call — we chunk automatically.
+//
+// The blast is a free-form composer (subject + intro copy) that can optionally
+// feature one or more published posts as "read more" cards — same shape as a
+// Substack/Mailchimp campaign, rather than being tied to exactly one post.
+
+interface FeaturedPost {
+  slug:      string;
+  title:     string;
+  excerpt:   string;
+  category?: string;
+}
 
 interface BlastPayload {
-  postSlug:     string;
-  postTitle:    string;
-  postExcerpt:  string;
-  postCategory?: string;
+  subject:  string;
+  bodyText?: string;
+  posts?:   FeaturedPost[];
 }
 
 router.post('/blast', async (req, res) => {
-  const { postSlug, postTitle, postExcerpt, postCategory } =
-    req.body as BlastPayload;
+  const { subject, bodyText, posts } = req.body as BlastPayload;
+  const featuredPosts = Array.isArray(posts) ? posts : [];
 
-  if (!postSlug || !postTitle || !postExcerpt) {
+  if (!subject || !subject.trim()) {
+    return res.status(400).json({ error: 'subject is required.' });
+  }
+  if (!bodyText?.trim() && featuredPosts.length === 0) {
     return res.status(400).json({
-      error: 'postSlug, postTitle, and postExcerpt are required.',
+      error: 'Provide body text and/or at least one featured post.',
     });
   }
 
@@ -221,7 +234,7 @@ router.post('/blast', async (req, res) => {
     return res.status(200).json({ sent: 0, message: 'No active subscribers.' });
   }
 
-  console.log(`[newsletter/blast] Starting blast — ${allEmails.length} subscribers, post: "${postTitle}"`);
+  console.log(`[newsletter/blast] Starting blast — ${allEmails.length} subscribers, subject: "${subject}"`);
 
   // ── Send in batches of 100 (Resend batch limit) ──────────────────────────
   const BATCH_SIZE = 100;
@@ -236,9 +249,9 @@ router.post('/blast', async (req, res) => {
       return {
         from:    getFromHeader(),
         to:      email,
-        subject: postTitle,
-        html:    buildBlastHtml({ postSlug, postTitle, postExcerpt, postCategory, unsubscribeLink }),
-        text:    buildBlastText({ postSlug, postTitle, postExcerpt, postCategory, unsubscribeLink }),
+        subject,
+        html:    buildBlastHtml({ subject, bodyText, posts: featuredPosts, unsubscribeLink }),
+        text:    buildBlastText({ subject, bodyText, posts: featuredPosts, unsubscribeLink }),
         headers: getListUnsubscribeHeaders(unsubscribeLink),
       };
     });
@@ -505,28 +518,115 @@ function buildWelcomeText({
 }
 
 // ─── Blast email HTML ─────────────────────────────────────────────────────────
+// escapeHtml guards admin-typed subject/body copy — post title/excerpt come
+// from the CMS and keep the original unescaped behaviour.
+
+function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 
 function buildBlastHtml({
-  postSlug,
-  postTitle,
-  postExcerpt,
-  postCategory,
+  subject,
+  bodyText,
+  posts,
   unsubscribeLink,
 }: {
-  postSlug:        string;
-  postTitle:       string;
-  postExcerpt:     string;
-  postCategory?:   string;
+  subject:         string;
+  bodyText?:       string;
+  posts:           FeaturedPost[];
   unsubscribeLink: string;
 }): string {
   const siteUrl      = (process.env.FRONTEND_URL ?? 'http://localhost:8080').replace(/\/$/, '');
   const siteName     = process.env.SITE_NAME ?? 'CryptoMoney';
   const siteHost     = siteUrl.replace(/https?:\/\//, '');
   const postalAddress = process.env.SITE_POSTAL_ADDRESS ?? '';
-  const postUrl      = `${siteUrl}/blog/${postSlug}`;
-  const categoryLabel = postCategory
-    ? postCategory.charAt(0).toUpperCase() + postCategory.slice(1)
-    : 'Analysis';
+
+  const bodyParagraphs = (bodyText ?? '')
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const introHtml = bodyParagraphs.length
+    ? `
+          <tr>
+            <td style="padding: 14px 40px 28px; border-bottom: 1px solid #222736;">
+              <h1 style="margin: 0 0 14px; font-size: 22px; font-weight: 700;
+                         color: #dde0e8; letter-spacing: -0.04em; line-height: 1.3;">
+                ${escapeHtml(subject)}
+              </h1>
+              ${bodyParagraphs
+                .map(
+                  (p) => `
+              <p style="margin: 0 0 14px; font-size: 14px; color: #9aa0b4; line-height: 1.75;">
+                ${escapeHtml(p)}
+              </p>`,
+                )
+                .join('')}
+            </td>
+          </tr>`
+    : `
+          <tr>
+            <td style="padding: 14px 40px 28px; border-bottom: 1px solid #222736;">
+              <h1 style="margin: 0; font-size: 22px; font-weight: 700;
+                         color: #dde0e8; letter-spacing: -0.04em; line-height: 1.3;">
+                ${escapeHtml(subject)}
+              </h1>
+            </td>
+          </tr>`;
+
+  const postCards = posts
+    .map((post) => {
+      const postUrl = `${siteUrl}/blog/${post.slug}`;
+      const categoryLabel = post.category
+        ? post.category.charAt(0).toUpperCase() + post.category.slice(1)
+        : 'Analysis';
+      return `
+          <tr>
+            <td style="padding: 20px 40px; border-bottom: 1px solid #222736;">
+              <span style="display: inline-block; margin-bottom: 10px;
+                           background: rgba(79,142,247,0.10);
+                           border: 1px solid rgba(79,142,247,0.22);
+                           border-radius: 999px; padding: 3px 11px;
+                           font-size: 10px; font-weight: 600;
+                           letter-spacing: 0.08em; text-transform: uppercase;
+                           color: #4f8ef7;">
+                ${categoryLabel}
+              </span>
+              <h2 style="margin: 0 0 8px; font-size: 16px; font-weight: 700;
+                         color: #dde0e8; letter-spacing: -0.02em; line-height: 1.35;">
+                ${post.title}
+              </h2>
+              <p style="margin: 0 0 14px; font-size: 13px; color: #9aa0b4; line-height: 1.7;">
+                ${post.excerpt}
+              </p>
+              <a href="${postUrl}"
+                 style="display: inline-block; padding: 8px 18px;
+                        background: #4f8ef7; color: #ffffff;
+                        font-size: 12px; font-weight: 600;
+                        text-decoration: none; border-radius: 5px;
+                        letter-spacing: -0.01em;">
+                Read article
+              </a>
+            </td>
+          </tr>`;
+    })
+    .join('');
+
+  const postsSection = posts.length
+    ? `
+          <tr>
+            <td style="padding: 20px 40px 0;">
+              <p style="margin: 0; font-size: 10px; font-weight: 600;
+                        letter-spacing: 0.1em; text-transform: uppercase; color: #3d4254;">
+                Featured reads
+              </p>
+            </td>
+          </tr>
+          ${postCards}`
+    : '';
 
   return /* html */`
 <!DOCTYPE html>
@@ -535,7 +635,7 @@ function buildBlastHtml({
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="dark" />
-  <title>${postTitle}</title>
+  <title>${escapeHtml(subject)}</title>
   <!--[if mso]>
   <noscript>
     <xml><o:OfficeDocumentSettings>
@@ -581,56 +681,11 @@ function buildBlastHtml({
             </td>
           </tr>
 
-          <!-- Category pill -->
-          <tr>
-            <td style="padding: 28px 40px 0;">
-              <span style="display: inline-block;
-                           background: rgba(79,142,247,0.10);
-                           border: 1px solid rgba(79,142,247,0.22);
-                           border-radius: 999px; padding: 3px 11px;
-                           font-size: 10px; font-weight: 600;
-                           letter-spacing: 0.08em; text-transform: uppercase;
-                           color: #4f8ef7;">
-                ${categoryLabel}
-              </span>
-            </td>
-          </tr>
+          <!-- Intro / subject -->
+          ${introHtml}
 
-          <!-- Post title + excerpt -->
-          <tr>
-            <td style="padding: 14px 40px 28px; border-bottom: 1px solid #222736;">
-              <h1 style="margin: 0 0 12px; font-size: 22px; font-weight: 700;
-                         color: #dde0e8; letter-spacing: -0.04em; line-height: 1.3;">
-                ${postTitle}
-              </h1>
-              <p style="margin: 0; font-size: 14px; color: #9aa0b4; line-height: 1.75;">
-                ${postExcerpt}
-              </p>
-            </td>
-          </tr>
-
-          <!-- Read CTA row -->
-          <tr>
-            <td style="padding: 18px 40px; border-bottom: 1px solid #222736;">
-              <table width="100%" cellpadding="0" cellspacing="0">
-                <tr>
-                  <td style="font-size: 11px; color: #3d4254; vertical-align: middle;">
-                    Full analysis on ${siteName}
-                  </td>
-                  <td align="right">
-                    <a href="${postUrl}"
-                       style="display: inline-block; padding: 9px 20px;
-                              background: #4f8ef7; color: #ffffff;
-                              font-size: 12px; font-weight: 600;
-                              text-decoration: none; border-radius: 5px;
-                              letter-spacing: -0.01em;">
-                      Read article
-                    </a>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
+          <!-- Featured posts (optional) -->
+          ${postsSection}
 
           <!-- Footer -->
           <tr>
@@ -670,39 +725,46 @@ function buildBlastHtml({
 // ─── Blast email plain-text alternative ──────────────────────────────────────
 
 function buildBlastText({
-  postSlug,
-  postTitle,
-  postExcerpt,
-  postCategory,
+  subject,
+  bodyText,
+  posts,
   unsubscribeLink,
 }: {
-  postSlug:        string;
-  postTitle:       string;
-  postExcerpt:     string;
-  postCategory?:   string;
+  subject:         string;
+  bodyText?:       string;
+  posts:           FeaturedPost[];
   unsubscribeLink: string;
 }): string {
   const siteUrl  = (process.env.FRONTEND_URL ?? 'http://localhost:8080').replace(/\/$/, '');
   const siteName = process.env.SITE_NAME ?? 'CryptoMoney';
   const postalAddress = process.env.SITE_POSTAL_ADDRESS ?? '';
-  const postUrl  = `${siteUrl}/blog/${postSlug}`;
-  const categoryLabel = postCategory
-    ? postCategory.charAt(0).toUpperCase() + postCategory.slice(1)
-    : 'Analysis';
 
-  return [
-    `[${categoryLabel}] ${postTitle}`,
-    '',
-    postExcerpt,
-    '',
-    `Read the full article: ${postUrl}`,
-    '',
+  const lines: string[] = [subject, ''];
+
+  if (bodyText?.trim()) {
+    lines.push(bodyText.trim(), '');
+  }
+
+  if (posts.length) {
+    lines.push('FEATURED READS', '');
+    for (const post of posts) {
+      const categoryLabel = post.category
+        ? post.category.charAt(0).toUpperCase() + post.category.slice(1)
+        : 'Analysis';
+      const postUrl = `${siteUrl}/blog/${post.slug}`;
+      lines.push(`[${categoryLabel}] ${post.title}`, post.excerpt, postUrl, '');
+    }
+  }
+
+  lines.push(
     '---',
     `You received this because you subscribed at ${siteUrl}. We will never share your address with third parties.`,
     `Unsubscribe: ${unsubscribeLink}`,
     '',
     `${siteName}${postalAddress ? ` — ${postalAddress}` : ''}`,
-  ].join('\n');
+  );
+
+  return lines.join('\n');
 }
 
 export { router as newsletterRouter };

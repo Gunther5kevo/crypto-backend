@@ -9,6 +9,7 @@ import './queue/queues';
 import './workers/aiEnrichWorker';
 import './workers/storeWorker';
 import './workers/telegramNotifier';
+import './workers/weeklyDigestWorker';
 
 dotenv.config();
 

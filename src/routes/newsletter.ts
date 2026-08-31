@@ -170,6 +170,71 @@ router.get('/blast/stats', async (_req, res) => {
   return res.json({ activeSubscribers: count ?? 0 });
 });
 
+// ─── GET /draft ────────────────────────────────────────────────────────────────
+// Returns the latest auto-generated weekly draft (see weeklyDigestWorker.ts),
+// so the admin composer can open pre-filled instead of blank.
+
+router.get('/draft', async (_req, res) => {
+  const supabase = getSupabase();
+
+  const { data: draft, error } = await supabase
+    .from('newsletter_drafts')
+    .select('*')
+    .eq('status', 'pending')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[newsletter/draft] Fetch error:', error);
+    return res.status(500).json({ error: 'Could not fetch draft.' });
+  }
+  if (!draft) return res.json({ draft: null });
+
+  let posts: FeaturedPost[] = [];
+  if (draft.post_ids?.length) {
+    const { data: postRows } = await supabase
+      .from('posts')
+      .select('id, slug, title, excerpt, category')
+      .in('id', draft.post_ids);
+
+    const byId = new Map((postRows ?? []).map((p) => [p.id, p]));
+    posts = (draft.post_ids as string[])
+      .map((id) => byId.get(id))
+      .filter((p): p is NonNullable<typeof p> => !!p)
+      .map((p) => ({ slug: p.slug, title: p.title, excerpt: p.excerpt, category: p.category }));
+  }
+
+  return res.json({
+    draft: {
+      id: draft.id,
+      subject: draft.subject,
+      bodyText: draft.body_text,
+      posts,
+      createdAt: draft.created_at,
+    },
+  });
+});
+
+// ─── POST /draft/:id/dismiss ────────────────────────────────────────────────────
+// Lets the admin discard an auto-draft without sending it, so it doesn't
+// keep reappearing on every page load.
+
+router.post('/draft/:id/dismiss', async (req, res) => {
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from('newsletter_drafts')
+    .update({ status: 'dismissed' })
+    .eq('id', req.params.id)
+    .eq('status', 'pending');
+
+  if (error) {
+    console.error('[newsletter/draft/dismiss] Update error:', error);
+    return res.status(500).json({ error: 'Could not dismiss draft.' });
+  }
+  return res.status(200).json({ ok: true });
+});
+
 // ─── POST /blast ──────────────────────────────────────────────────────────────
 // Fetches all active subscribers in pages of 500 and sends via Resend batch API.
 // Resend batch allows up to 100 emails per call — we chunk automatically.
@@ -189,10 +254,11 @@ interface BlastPayload {
   subject:  string;
   bodyText?: string;
   posts?:   FeaturedPost[];
+  draftId?: string;
 }
 
 router.post('/blast', async (req, res) => {
-  const { subject, bodyText, posts } = req.body as BlastPayload;
+  const { subject, bodyText, posts, draftId } = req.body as BlastPayload;
   const featuredPosts = Array.isArray(posts) ? posts : [];
 
   if (!subject || !subject.trim()) {
@@ -274,6 +340,13 @@ router.post('/blast', async (req, res) => {
   }
 
   console.log(`[newsletter/blast] ✅ Done — sent: ${totalSent}, failed: ${totalFailed}`);
+
+  if (draftId) {
+    await supabase
+      .from('newsletter_drafts')
+      .update({ status: 'sent', sent_at: new Date().toISOString() })
+      .eq('id', draftId);
+  }
 
   return res.json({
     sent:    totalSent,

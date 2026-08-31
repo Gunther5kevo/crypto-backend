@@ -45,4 +45,11 @@ export const notifyQueue = new Queue('notify_post', {
   defaultJobOptions,
 });
 
+// Weekly newsletter auto-draft — see workers/weeklyDigestWorker.ts for the
+// repeatable-job schedule that feeds this queue.
+export const digestQueue = new Queue('weekly_digest', {
+  connection: redisConnection,
+  defaultJobOptions,
+});
+
 console.log('[queue] ✅ Queues initialized');

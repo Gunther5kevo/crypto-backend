@@ -5,6 +5,7 @@ import { NormalizedMessage } from '../types/message';
 import { Post, ReferralLink } from '../supabase/client';
 import { supabase } from '../supabase/client';
 import { isCryptoRelevant } from '../filters/cryptoRelevance';
+import { cleanSourceText } from '../utils/textClean';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -378,41 +379,11 @@ function formatCoinContext(coins: CoinData[]): string {
 }
 
 // ─────────────────────────────────────────────────────────────
-// SECTION 7b — TELEGRAM QUICK UPDATE FORMATTER
+// SECTION 7b — TELEGRAM QUICK UPDATES
+// Moved to telegramNotifier.ts (sendQuickUpdate). It now cleans,
+// de-duplicates, escapes and formats in one place, so the headline
+// is never a second copy of the body.
 // ─────────────────────────────────────────────────────────────
-function extractHeadline(text: string): string {
-  const sentences = text
-    .split(/(?<=[.!?])\s+/)
-    .map(s => s.trim())
-    .filter(s => s.length > 20);
-
-  const hot = sentences.find(s => /\$[\d,]|[\d.]+%|btc|eth|sol|xrp|bnb/i.test(s));
-  return (hot || sentences[0] || text).slice(0, 160);
-}
-
-function formatTelegramQuickUpdate(text: string, _author: string): string {
-  const stripped = text.replace(/@\w+/g, '').replace(/\n{3,}/g, '\n\n').trim();
-  const headline = extractHeadline(stripped);
-  const body = stripped
-    .replace(/\*\*/g, '')
-    .replace(/\*/g, '')
-    .replace(/`/g, '')
-    .replace(/_/g, ' ')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-
-  const preview = body.length > 400 ? body.slice(0, 397) + '…' : body;
-
-  const lines: string[] = [
-    `<b>${headline}</b>`,
-    '',
-    preview,
-    '',
-    `@cryptomoney`,
-  ];
-
-  return lines.join('\n').trim();
-}
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 8 — INTERNAL LINK FETCHER
@@ -480,7 +451,7 @@ function buildSchemaJsonLd(post: Post, publishedAt: string, siteBaseUrl: string)
 // SECTION 9b — MARKDOWN PLAIN-TEXT HELPER
 // Strips Markdown syntax (headings, emphasis, links, bullets) down
 // to readable prose, used for word counts / keyword density / the
-// Telegram excerpt. Content is Markdown from Section 13 onward.
+// fallback excerpt. Content is Markdown from Section 13 onward.
 // ─────────────────────────────────────────────────────────────
 function stripMarkdown(md: string): string {
   return (md || '')
@@ -1168,10 +1139,32 @@ function messageFingerprint(text: string): string {
   return text.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 120);
 }
 
+// Strips trailing punctuation that the URL regex picks up from
+// Markdown links like [label](https://example.com) → "https://example.com)"
+function cleanUrls(urls: string[] | undefined): string[] {
+  const cleaned = (urls ?? []).map(u => u.replace(/[)\]>.,;!?]+$/, ''));
+  return [...new Set(cleaned.filter(Boolean))];
+}
+
 export const aiEnrichWorker = new Worker(
   'ingest_message',
   async (job: Job) => {
-    const msg: NormalizedMessage = job.data;
+    // ── Step 0: Normalise the incoming message ────────────────
+    // GramJS renders formatting as Markdown (**bold**), and some channels
+    // repeat the same block several times. Clean once here so every
+    // later step (filters, prompt, Telegram quick updates) sees tidy text.
+    const incoming: NormalizedMessage = job.data;
+    const msg: NormalizedMessage = {
+      ...incoming,
+      text:     cleanSourceText(incoming.text || ''),
+      urls:     cleanUrls(incoming.urls),
+      hashtags: incoming.hashtags ?? [],
+    };
+
+    if (!msg.text) {
+      console.log(`[aiWorker] ⚡ Empty message after cleaning from ${msg.author} — skipping`);
+      return;
+    }
 
     // ── Step 1: Blog-worthiness filter ───────────────────────
     if (!shouldBlog(msg.text)) {
@@ -1179,9 +1172,8 @@ export const aiEnrichWorker = new Worker(
       console.log(`[aiWorker] ⚡ Skipping blog from ${msg.author} — filtered. Preview: "${preview}"`);
 
       if (isCryptoRelevant(msg.text)) {
-        const { sendToChannel } = await import('../workers/telegramNotifier');
-        const formatted = formatTelegramQuickUpdate(msg.text, msg.author);
-        await sendToChannel(formatted);
+        const { sendQuickUpdate } = await import('../workers/telegramNotifier');
+        await sendQuickUpdate(msg.text);
       } else {
         console.log(`[aiWorker] 🚫 Not crypto-relevant — no Telegram alert sent. Preview: "${preview}"`);
       }
@@ -1282,9 +1274,9 @@ export const aiEnrichWorker = new Worker(
       }
 
       function logPost(p: Post, attempt: 'first' | 'retry'): void {
-        const wordCount = p.content?.replace(/<[^>]+>/g, '').split(/\s+/).filter(Boolean).length ?? 0;
-        // Count real internal links after sanitisation
-        const internalLinkCount = (p.content?.match(/<a\s[^>]*href="[^"]*\/posts\/[^"/?#]+"[^>]*>/gi) || []).length;
+        // Content is Markdown, so count words and links the Markdown way
+        const wordCount = stripMarkdown(p.content || '').split(/\s+/).filter(Boolean).length;
+        const internalLinkCount = (p.content?.match(/\]\([^)]*\/blog\/[^)]+\)/g) || []).length;
         console.log(`[aiWorker] ✅ AI post generated (${attempt} attempt):`, {
           model_used:          model,
           title:               p.title,
@@ -1363,19 +1355,20 @@ export const aiEnrichWorker = new Worker(
 
       } catch (err) {
         console.error('[aiWorker] ⚠️ AI failed, using fallback:', err);
-        const title = msg.text.split(/[.\n]/)[0].slice(0, 80);
+        const plainSource = stripMarkdown(msg.text);
+        const title = stripMarkdown(msg.text.split(/[.\n]/)[0]).slice(0, 80);
         post = {
           title,
           slug:             slugify(title),
           content:          msg.text,
-          excerpt:          msg.text.slice(0, 200),
+          excerpt:          plainSource.slice(0, 200),
           author:           msg.author,
           tags:             buildTags(undefined, msg.hashtags, category),
           category,
           referral_links:   buildReferralLinks(msg.urls),
           is_published:     false,
           meta_title:       title.slice(0, 60),
-          meta_description: msg.text.slice(0, 155),
+          meta_description: plainSource.slice(0, 155),
           focus_keyword:    sanitiseFocusKeyword(msg.hashtags[0] || category),
           reading_time_min: 1,
         };

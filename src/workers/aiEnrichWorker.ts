@@ -6,6 +6,16 @@ import { Post, ReferralLink } from '../supabase/client';
 import { supabase } from '../supabase/client';
 import { isCryptoRelevant } from '../filters/cryptoRelevance';
 import { cleanSourceText } from '../utils/textClean';
+import {
+  detectCoinsSafe,
+  hasEnoughSubstance,
+  isCryptoContent,
+  findMetaLeaks,
+  findRepeatedFigures,
+  findPadding,
+  isTemplateRepeat,
+  decide,
+} from './contentGuard';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -139,7 +149,7 @@ async function isDuplicate(text: string, title: string): Promise<boolean> {
     // Match against the full stored article, not just the excerpt — a short
     // source message (Telegram-style, terse) rarely shares 60%+ of its words
     // with a 200-char excerpt even when it's the same story reworded by a
-    // different channel, but it does show up against the full ~800-word body.
+    // different channel, but it does show up against the full stored body.
     for (const post of recentPosts) {
       const existing = `${post.title} ${post.excerpt} ${post.content}`.toLowerCase();
       const matchCount = keywords.filter(kw => existing.includes(kw)).length;
@@ -315,14 +325,10 @@ const COIN_MAP: Record<string, string> = {
   maker: 'maker', mkr: 'maker',
 };
 
-function detectCoins(text: string): string[] {
-  const lower = text.toLowerCase();
-  const found = new Set<string>();
-  for (const [keyword, coinId] of Object.entries(COIN_MAP)) {
-    if (lower.includes(keyword)) found.add(coinId);
-  }
-  return [...found].slice(0, 5);
-}
+// NOTE: coin detection now lives in contentGuard.ts → detectCoinsSafe().
+// The old version used lower.includes(keyword), so "op" matched "stop",
+// "ton" matched "Washington", "link" matched "linked", etc., which attached
+// random coins (and their prices) to unrelated stories.
 
 async function fetchCoinData(coinIds: string[]): Promise<CoinData[]> {
   if (!coinIds.length) return [];
@@ -405,7 +411,7 @@ async function fetchInternalLinks(category: string): Promise<InternalLink[]> {
 
     if (error || !data) return [];
 
-    const sameCategory = data.filter(p => p.category === category);
+    const sameCategory = data.filter((p: any) => p.category === category);
     const pool = sameCategory.length >= 3 ? sameCategory : data;
     return pool.slice(0, 5);
   } catch {
@@ -516,17 +522,15 @@ function checkQuality(post: Post): QualityResult {
   const sentences  = plainText.split(/[.!?]+/).filter(s => s.trim().length > 10);
   const fullKeyword = post.focus_keyword?.toLowerCase().trim() || '';
 
-  // 1. Word count (25 pts)
-  if (wordCount >= 800) {
+  // 1. Word count (25 pts) — sized to what a real news story supports.
+  // (Was 800+, which forced the model to pad thin sources with filler.)
+  if (wordCount >= 300) {
     score += 25;
-  } else if (wordCount >= 700) {
+  } else if (wordCount >= 250) {
     score += 18;
-    reasons.push(`Word count good but short (${wordCount}/800 ideal)`);
-  } else if (wordCount >= 500) {
-    score += 10;
-    reasons.push(`Word count low (${wordCount}/700 minimum)`);
+    reasons.push(`Word count short but acceptable (${wordCount}/300 ideal)`);
   } else {
-    reasons.push(`Word count too short (${wordCount}/500 absolute minimum)`);
+    reasons.push(`Word count too short (${wordCount}/250 absolute minimum)`);
   }
 
   // 2. Sentence variety (5 pts)
@@ -651,11 +655,12 @@ function buildPrompt(
   const coinInstructions = hasCoinData
     ? `
 ════════════════════════════════════════════
-LIVE MARKET DATA — EMBED THESE EXACT FIGURES
+LIVE MARKET DATA — USE THESE EXACT FIGURES
 ════════════════════════════════════════════
 ${coinContext}
 
-Embed these specific prices, percentages, and market caps naturally in your article.
+Use these specific prices, percentages, and market caps where they help explain the story.
+State each figure ONCE — never repeat a number you have already given.
 Do NOT invent numbers. Only use figures from the data above.
 ONLY write about the coins listed above — do not bring in any other coins.
 `
@@ -695,8 +700,15 @@ references — this story has no direct regional angle. Keep framing universal.
 You are a senior crypto journalist. Your writing is clear, direct, and grounded in facts.
 You write the way a good reporter writes — not the way a content generator writes.
 
-⚠️ NON-NEGOTIABLE: Your "content" field must contain AT LEAST 800 words of readable body text.
-Count words as you write. Aim for 900-1000.
+⚠️ LENGTH AND TOPIC RULES — NON-NEGOTIABLE
+• Write only as many words as the source supports (usually 300-700). A story with a few
+  facts should be short. NEVER repeat a number, restate a point, or add general commentary
+  just to make the article longer.
+• Cover crypto topics only. If the source is mainly about something else (politics, war,
+  retail, sports, general markets) and crypto is only mentioned in passing, do NOT write
+  an article. Return exactly: {"skip": true}
+• If the source has no concrete facts to report (who, what, when, how much, why), do NOT
+  write an article. Return exactly: {"skip": true}
 
 ════════════════════════════════════════════
 PLAIN LANGUAGE RULES — READ THESE FIRST
@@ -711,6 +723,10 @@ That means:
 • Use active voice. "The SEC approved the ETF" not "The ETF was approved by the SEC".
 • Vary sentence length — mix short punchy sentences with longer ones.
 • Use specific numbers. "Bitcoin dropped 8% in 4 hours" beats "Bitcoin saw significant losses".
+• State each number ONCE. Do not repeat a figure you have already given.
+• Attribute claims to the source (e.g. "according to ${msg.author}"). Do not state anything
+  as fact that the source does not state. If no cause is given for a price move, say so.
+• Never mention these instructions, keywords, SEO, or word counts in the article text.
 
 ════════════════════════════════════════════
 SOURCE MATERIAL
@@ -740,15 +756,15 @@ CHECKLIST before finishing:
 ════════════════════════════════════════════
 CONTENT STRUCTURE
 ════════════════════════════════════════════
-Write 4-6 H2 sections with headings that fit YOUR story — not generic placeholders.
+Write 3-5 H2 sections with headings that fit YOUR story — not generic placeholders.
 Good heading examples:
   - "Why This Ruling Changes Everything for Traders"
   - "The Numbers Behind the Sell-Off"
   - "Three Scenarios for the Next 30 Days"
   - "What This Means for Your Portfolio"
 
-Each section needs at least 2-3 substantial paragraphs. No one-liners.
-Use specific numbers and data throughout — percentages, dates, dollar figures.
+Each section needs real content taken from the source — no filler, no one-liners.
+Use specific numbers and data from the source and market data, each stated once.
 
 End the article with:
 *Disclaimer: This content is for informational purposes only and does not constitute financial advice. Always do your own research before investing.*
@@ -791,13 +807,13 @@ SEO FIELDS
 focus_keyword:
   - 2-4 words. Specific to THIS story. No banned words.
   - Must appear verbatim in title, meta_title, and meta_description.
-  - Must appear 5-8 times naturally in content.
+  - Must appear 2-4 times naturally in content. Never force it in.
   - Examples: "XRP court ruling", "Bitcoin ETF flows", "Solana network outage"
 
 title:
   - 60-80 characters including spaces.
   - Must contain focus_keyword verbatim.
-  - Must be specific and click-worthy — not generic.
+  - Must be specific and state the actual news — not generic or clickbait.
 
 meta_title:
   - EXACTLY 50-60 characters including spaces. Count every character.
@@ -819,15 +835,17 @@ tags:
 ════════════════════════════════════════════
 FINAL CHECKS BEFORE WRITING JSON
 ════════════════════════════════════════════
-1. Word count in "content" ≥ 800? If not — add sections.
-2. meta_title exactly 50-60 chars? Count manually.
-3. meta_description exactly 120-160 chars? Count manually.
-4. focus_keyword in title verbatim? Fix if not.
-5. Any banned words used? Remove them.
-6. Does every sentence mean something? Cut filler.
-7. Exactly 2 internal links used, both copied verbatim from the list? Verify.
+1. Is the story mainly about crypto, with enough concrete facts? If not, return {"skip": true}.
+2. Did you pad? Cut anything the source does not support. Each number appears once.
+3. meta_title exactly 50-60 chars? Count manually.
+4. meta_description exactly 120-160 chars? Count manually.
+5. focus_keyword in title verbatim? Fix if not.
+6. Any banned words used? Remove them.
+7. Does every sentence mean something? Cut filler.
+8. Exactly 2 internal links used, both copied verbatim from the list? Verify.
+9. Does the text mention keywords, SEO, instructions or word counts? Remove it.
 
-Only write JSON after all 7 checks pass.
+Only write JSON after all 9 checks pass.
 
 ════════════════════════════════════════════
 OUTPUT: VALID JSON ONLY
@@ -836,8 +854,8 @@ the JSON object. "content" holds Markdown text (see FORMAT above); escape
 newlines and quotes properly so the JSON itself stays valid.
 
 {
-  "title": "60-80 chars, contains focus_keyword, specific and click-worthy",
-  "content": "## Heading\n\nParagraph text...\n\n## Another Heading\n\nMore text... — minimum 800 words of body text",
+  "title": "60-80 chars, contains focus_keyword, specific and states the news",
+  "content": "## Heading\\n\\nParagraph text...\\n\\n## Another Heading\\n\\nMore text...",
   "excerpt": "150-200 chars, focus_keyword + one specific data point",
   "meta_title": "EXACTLY 50-60 chars",
   "meta_description": "EXACTLY 120-160 chars",
@@ -867,20 +885,15 @@ function buildRepairPrompt(
 
   const fixes: string[] = [];
 
-  if (reasons.some(r => r.includes('Word count'))) {
-    const needed = 800 - wordCount;
-    fixes.push(
-      `WORD COUNT: Your draft has ${wordCount} words. You need at least ${needed} more words of body text.` +
-      ` Add 1-2 new H2 sections with substantive paragraphs. Do not pad — write genuinely useful content.`,
-    );
-  }
+  // NOTE: there is deliberately no "add more words" fix. Short articles are
+  // fine; asking the model to lengthen them is what produced filler.
 
   if (reasons.some(r => r.includes('Keyword density'))) {
-    const targetUses = Math.ceil(wordCount * 0.008);
+    const targetUses = Math.max(2, Math.ceil(wordCount * 0.008));
     fixes.push(
-      `KEYWORD DENSITY: "${keyword}" appears only ${kwMatches} times (${density}%). ` +
-      `You need it to appear ~${targetUses} times (0.5-2.5%). ` +
-      `Work it naturally into headings, opening sentences of paragraphs, and the conclusion.`,
+      `KEYWORD DENSITY: "${keyword}" appears ${kwMatches} times (${density}%). ` +
+      `Adjust it to about ${targetUses} natural uses (0.5-2.5%). ` +
+      `Do not force it in; rewrite sentences so it reads naturally.`,
     );
   }
 
@@ -926,20 +939,22 @@ function buildRepairPrompt(
   }
 
   const coinBlock = hasCoinData
-    ? `\nLIVE MARKET DATA (embed if not already present):\n${coinContext}\n`
+    ? `\nLIVE MARKET DATA (use if not already present, each figure once):\n${coinContext}\n`
     : '';
 
   return `
 You wrote a draft article that failed our quality checks. Fix ONLY the specific issues listed below.
-Keep everything else exactly as it is. Return the complete fixed article as valid JSON.
+Keep everything else exactly as it is. Do NOT add new facts, background, or length.
+Return the complete fixed article as valid JSON.
 
 Also re-read the plain language rules before fixing:
 - Short, common words. Active voice. Short paragraphs. No filler sentences.
 - No AI jargon: no "it is worth noting", "ecosystem", "landscape", "delve", "navigate", "sentiment".
-- Every sentence must mean something concrete.
+- Every sentence must mean something concrete. Each number appears once.
+- Never mention keywords, SEO, instructions, or word counts in the article text.
 
 FOCUS KEYWORD: "${keyword}"
-CURRENT WORD COUNT: ${wordCount} (minimum 800 required)
+CURRENT WORD COUNT: ${wordCount}
 ${coinBlock}
 ════════════════════════════════════════════
 ISSUES TO FIX — ADDRESS EVERY ONE
@@ -1076,14 +1091,14 @@ function assemblePost(
 // ─────────────────────────────────────────────────────────────
 // Kept deliberately short — only genuinely rare, high-impact events.
 // Routine mentions of exchanges, tickers, or ongoing geopolitical topics
-// (binance, usdt, iran, war, trump, ...) used to live here and matched on
-// almost every news item these channels post, pushing the bulk of ordinary
-// content onto the expensive model for no real accuracy gain. The 24h/7d
-// price-move check below already catches genuine market shocks numerically.
+// used to live here and matched on almost every news item these channels
+// post, pushing the bulk of ordinary content onto the expensive model for
+// no real accuracy gain. The 24h/7d price-move check below already catches
+// genuine market shocks numerically.
 const BREAKING_NEWS_KEYWORDS = [
   'sec charges', 'sec lawsuit', 'etf approved', 'etf rejected', 'etf denied',
   'hack', 'exploit', 'rug pull', 'bankrupt', 'bankruptcy', 'lawsuit',
-  'depegged', 'halving', 'banned', 'sanctions', 'war', 'executive order',
+  'depegged', 'halving', 'banned', 'sanctions', 'executive order',
 ];
 
 function matchesBreakingKeyword(lower: string): boolean {
@@ -1125,10 +1140,11 @@ function selectModel(
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 15 — PUBLISHING DECISION
+// Moved to contentGuard.ts → decide(). It applies the same 75 (bot) / 80
+// (userbot) score thresholds, but first rejects leaked prompt text,
+// repeated-template titles, off-topic or too-thin articles. Auto-publish
+// requires AUTO_PUBLISH=true in .env; otherwise posts go to drafts.
 // ─────────────────────────────────────────────────────────────
-function shouldPublish(source: string, score: number): boolean {
-  return source === 'bot' ? score >= 75 : score >= 80;
-}
 
 // ─────────────────────────────────────────────────────────────
 // SECTION 16 — MAIN WORKER
@@ -1180,6 +1196,29 @@ export const aiEnrichWorker = new Worker(
       return;
     }
 
+    // ── Step 1b: CRYPTO-ONLY GATE ────────────────────────────
+    // The story must clearly be about crypto. One passing mention
+    // ("...could shake crypto pricing") is not enough.
+    const coinsEarly = detectCoinsSafe(msg.text, COIN_MAP);
+    const cryptoCheck = isCryptoContent(msg.text, coinsEarly.length, 2);
+    if (!cryptoCheck.ok) {
+      console.log(`[aiWorker] 🚫 Off-topic, not published: ${cryptoCheck.reason}`);
+      return;
+    }
+
+    // ── Step 1c: SUBSTANCE GATE ──────────────────────────────
+    // A source with no concrete facts can't honestly become an article.
+    // It still goes out as a Telegram quick update.
+    const substance = hasEnoughSubstance(msg.text);
+    if (!substance.ok) {
+      console.log(`[aiWorker] ⚡ No blog post: ${substance.reason}`);
+      if (isCryptoRelevant(msg.text)) {
+        const { sendQuickUpdate } = await import('../workers/telegramNotifier');
+        await sendQuickUpdate(msg.text);
+      }
+      return;
+    }
+
     // ── Step 2a: In-memory race lock ─────────────────────────
     const fingerprint = messageFingerprint(msg.text);
     if (processingLock.has(fingerprint)) {
@@ -1205,8 +1244,8 @@ export const aiEnrichWorker = new Worker(
         `Africa context: ${africanContextRelevant ? 'YES' : 'no'} | source: ${msg.source}`,
       );
 
-      // ── Step 3: Detect coins ──────────────────────────────────
-      const detectedCoinIds = detectCoins(msg.text);
+      // ── Step 3: Detect coins (word-boundary safe) ─────────────
+      const detectedCoinIds = coinsEarly;
       const hasCoinData     = detectedCoinIds.length > 0;
 
       console.log(
@@ -1237,7 +1276,7 @@ export const aiEnrichWorker = new Worker(
         ? [
             'You are a senior crypto journalist for a high-authority news platform.',
             'RULE 1 — PLAIN LANGUAGE: Write clearly. Short words. Short paragraphs. Active voice. No AI jargon.',
-            'RULE 2 — WORD COUNT: Your "content" field must have 800+ words of readable body text.',
+            'RULE 2 — LENGTH: Write only what the source supports (usually 300-700 words). Never pad or repeat numbers. If the story is not mainly about crypto, or has no concrete facts, return {"skip": true}.',
             'RULE 3 — META TITLE: Must be exactly 50-60 characters including spaces.',
             'RULE 4 — COIN DISCIPLINE: Only write about coins in the provided market data.',
             'RULE 5 — NO BANNED WORDS: Never use "sentiment", "ecosystem", "landscape", "delve", "navigate".',
@@ -1247,12 +1286,12 @@ export const aiEnrichWorker = new Worker(
         : [
             'You are a crypto journalist. Write clearly — like a reporter, not a content bot.',
             '1. PLAIN LANGUAGE: Short sentences. Common words. Active voice. No jargon.',
-            '2. WORD COUNT: Minimum 800 words of body text.',
+            '2. LENGTH: Only what the source supports (usually 300-700 words). Never pad. Not mainly crypto, or no concrete facts → return {"skip": true}.',
             '3. META TITLE: Exactly 50-60 characters including spaces.',
             '4. COIN DISCIPLINE: Only write about coins in the provided market data.',
-            '5. Embed ALL price figures provided. Do not invent numbers.',
+            '5. Use the provided price figures where relevant, each once. Do not invent numbers.',
             '6. Include EXACTLY 2 internal links from the list provided. Copy verbatim. No more, no less.',
-            '7. Use 4-6 H2 sections with story-specific headings.',
+            '7. Use 3-5 H2 sections with story-specific headings.',
             '8. NEVER use: "sentiment", "ecosystem", "landscape", "delve", "navigate", "it is worth noting".',
             '9. Return ONLY valid JSON — no markdown, no backticks, no extra text.',
           ].join('\n');
@@ -1307,6 +1346,12 @@ export const aiEnrichWorker = new Worker(
           },
         ]);
 
+        // The model may decline: not mainly crypto, or not enough facts.
+        if (generated.skip === true) {
+          console.log(`[aiWorker] ⏭️ Model declined to write (not crypto / not enough facts) — ${msg.author}`);
+          return;
+        }
+
         post = assemblePost(generated, msg, category, publishedAt, internalLinks, siteBaseUrl);
         logPost(post, 'first');
 
@@ -1314,11 +1359,18 @@ export const aiEnrichWorker = new Worker(
         const firstQuality = checkQuality(post);
         const publishThreshold = msg.source === 'bot' ? 75 : 80;
 
-        if (!firstQuality.passes || firstQuality.score < publishThreshold) {
+        // Word-count shortfalls are never "repaired" — lengthening is what
+        // produces filler. Only real, fixable issues trigger a retry.
+        const repairable = firstQuality.reasons.filter(r => !r.startsWith('Word count'));
+
+        if (
+          repairable.length > 0 &&
+          (!firstQuality.passes || firstQuality.score < publishThreshold)
+        ) {
           console.log(
             `[aiWorker] 🔧 First attempt score: ${firstQuality.score}/100 — running repair retry...`,
           );
-          console.log('[aiWorker] 🔧 Issues to fix:', firstQuality.reasons);
+          console.log('[aiWorker] 🔧 Issues to fix:', repairable);
 
           try {
             const repaired = await callAI([
@@ -1327,7 +1379,7 @@ export const aiEnrichWorker = new Worker(
                 role: 'user',
                 content: buildRepairPrompt(
                   post,
-                  firstQuality.reasons,
+                  repairable,
                   coinContext,
                   internalLinksStr,
                   hasCoinData,
@@ -1336,47 +1388,66 @@ export const aiEnrichWorker = new Worker(
               },
             ]);
 
-            const repairedPost = assemblePost(repaired, msg, category, publishedAt, internalLinks, siteBaseUrl);
-            const retryQuality = checkQuality(repairedPost);
+            if (repaired.skip === true) {
+              console.log('[aiWorker] 🔧 Repair returned skip — keeping first attempt');
+            } else {
+              const repairedPost = assemblePost(repaired, msg, category, publishedAt, internalLinks, siteBaseUrl);
+              const retryQuality = checkQuality(repairedPost);
 
-            logPost(repairedPost, 'retry');
-            console.log(
-              `[aiWorker] 🔧 Repair score: ${retryQuality.score}/100 ` +
-              `(was ${firstQuality.score}/100) — ` +
-              (retryQuality.score > firstQuality.score ? '✅ improved' : '⚠️ no improvement, keeping retry anyway'),
-            );
+              logPost(repairedPost, 'retry');
+              console.log(
+                `[aiWorker] 🔧 Repair score: ${retryQuality.score}/100 ` +
+                `(was ${firstQuality.score}/100) — ` +
+                (retryQuality.score > firstQuality.score ? '✅ improved' : '⚠️ no improvement, keeping retry anyway'),
+              );
 
-            post = repairedPost;
-
+              post = repairedPost;
+            }
           } catch (retryErr) {
             console.warn('[aiWorker] ⚠️ Repair retry failed, keeping first attempt:', retryErr);
           }
         }
 
       } catch (err) {
-        console.error('[aiWorker] ⚠️ AI failed, using fallback:', err);
-        const plainSource = stripMarkdown(msg.text);
-        const title = stripMarkdown(msg.text.split(/[.\n]/)[0]).slice(0, 80);
-        post = {
-          title,
-          slug:             slugify(title),
-          content:          msg.text,
-          excerpt:          plainSource.slice(0, 200),
-          author:           msg.author,
-          tags:             buildTags(undefined, msg.hashtags, category),
-          category,
-          referral_links:   buildReferralLinks(msg.urls),
-          is_published:     false,
-          meta_title:       title.slice(0, 60),
-          meta_description: plainSource.slice(0, 155),
-          focus_keyword:    sanitiseFocusKeyword(msg.hashtags[0] || category),
-          reading_time_min: 1,
-        };
+        // No fallback article: publishing the raw source text as a post is
+        // copying someone else's message. Fail the job so the queue can retry.
+        console.error('[aiWorker] ❌ AI failed, nothing saved:', err);
+        throw err;
       }
 
       // ── Step 8: Final quality gate + publishing decision ─────
       const quality = checkQuality(post);
-      const publish = shouldPublish(msg.source, quality.score);
+      const plain   = stripMarkdown(post.content || '');
+      const words   = plain.split(/\s+/).filter(Boolean).length;
+
+      // Titles from the last 7 days — catches "same template, new number" repeats
+      const { data: recentRows } = await supabase
+        .from('posts')
+        .select('title')
+        .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
+        .limit(300);
+      const recentTitles: string[] = (recentRows ?? []).map((r: any) => r.title);
+
+      // The finished article must also be clearly about crypto
+      const articleCrypto = isCryptoContent(`${post.title}. ${plain}`, detectedCoinIds.length, 3);
+
+      const verdict = decide({
+        score:            quality.score,
+        threshold:        msg.source === 'bot' ? 75 : 80,   // same thresholds as before
+        metaLeaks:        findMetaLeaks(post),
+        repeatedFigures:  findRepeatedFigures(plain),
+        padding:          findPadding(plain),
+        templateRepeatOf: isTemplateRepeat(post.title, recentTitles),
+        notCrypto:        articleCrypto.ok ? null : articleCrypto.reason,
+        tooThin:          words < 250 ? `${words} words (minimum 250)` : null,
+      });
+
+      if (verdict.action === 'reject') {
+        console.log('[aiWorker] 🚫 Rejected, not saved:', verdict.reasons);
+        return;
+      }
+
+      const publish = verdict.action === 'publish';
       post.is_published = publish;
 
       const sourceLabel  = msg.source === 'bot' ? 'bot (threshold: 75)' : 'userbot (threshold: 80)';
@@ -1387,7 +1458,7 @@ export const aiEnrichWorker = new Worker(
       );
 
       if (!publish) {
-        console.log('[aiWorker] ⚠️ Quality issues:', quality.reasons);
+        console.log('[aiWorker] ⚠️ Held as draft:', [...quality.reasons, ...verdict.reasons]);
       }
 
       if (publish) {

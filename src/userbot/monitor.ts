@@ -11,7 +11,6 @@ const CHANNELS_TO_MONITOR = [
   "https://t.me/trading",
   "https://t.me/Spoilersignalsnews",
   "t.me/cryptomonied",
-  "https://t.me/just",
   "https://t.me/Tensor_news",
   "https://t.me/KingCryptoCalls",
   "https://t.me/CC_Crypto_Tips",

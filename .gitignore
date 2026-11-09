@@ -33,3 +33,8 @@ temp/
 
 # TypeScript
 *.tsbuildinfo
+
+# Cleanup script output
+clean-redirects.csv
+clean-report.csv
+clean-backup-*.json

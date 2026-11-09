@@ -96,11 +96,12 @@ const jargonIn = (plain: string) => AI_JARGON.filter(p => {
 //  2. If the title has a geopolitical / macro / entertainment word, it must contain
 //     a STRONG crypto term (Bitcoin, Binance, "crypto law"...). Generic "crypto"
 //     in a title like "...raises risk questions for crypto markets" is not enough.
-const STRONG = /\b(bitcoin|btc|ethereum|ether|eth|solana|xrp|ripple|cardano|dogecoin|bnb|stablecoins?|usdt|usdc|tether|circle|blockchain|mainnet|defi|dex|nfts?|altcoins?|memecoins?|meme coin|airdrops?|binance|coinbase|coinex|coincorner|kraken|bybit|okx|hyperliquid|polymarket|metaplanet|strive|mstr|saylor|clarity act|genius act|etfs?|lightning|halving|staking|on-?chain|hardware wallet|liquid network|blockstream|ledger|trezor|zcash|chainlink|uniswap|avalanche|polygon|polkadot|arbitrum|crypto (wallets?|exchanges?|custody|regulation|laws?|bans?|tax|rules|framework|licensing|scams?|hacks?|bills?|acts?|payments?|cards?|gift cards?|bank))\b/i;
+const STRONG = /\b(bitcoin|ethereum|ether|solana|xrp|ripple|cardano|dogecoin|digital assets?|stablecoins?|usdt|usdc|tether|circle|blockchain|mainnet|defi|dex|nfts?|altcoins?|memecoins?|meme coin|airdrops?|binance|coinbase|coinex|coincorner|kraken|bybit|okx|hyperliquid|polymarket|metaplanet|strive|mstr|saylor|clarity (act|bill|vote|delay|push)|genius act|etfs?|lightning|halving|staking|on-?chain|hardware wallet|liquid network|blockstream|ledger|trezor|zcash|chainlink|uniswap|avalanche|polygon|polkadot|arbitrum|crypto (wallets?|exchanges?|custody|regulation|legislation|policy|laws?|bans?|tax|rules|framework|licensing|scams?|hacks?|bills?|acts?|payments?|cards?|gift cards?|bank))\b/i;
 const GENERIC = /\b(crypto|cryptocurrency|cryptocurrencies|digital assets?|tokens?|tokenized|tokenization|web3|coins?)\b/i;
 const TICKER = /\b(BTC|ETH|SOL|XRP|ADA|DOGE|DOT|LINK|UNI|OP|ARB|NEAR|APT|SUI|INJ|FET|MATIC|MKR|GRAM|RENDER|AVAX|BNB|HYPE|LBTC|AAVE)\b/;
 const HOOK_HARD = /\b(iran\w*|israel\w*|gaza|hamas|houthis?|ansarallah|hormuz|strait|red sea|bab al-mandab|yemen\w*|russia\w*|putin|moscow|ukrain\w*|kyiv|kremlin|nato|brics|taiwan|north korea|south korea|saudi|aramco|opec|venezuela|maduro|xi jinping|netanyahu|zelensky|middle east|west bank|palestin\w*|macron|war|missiles?|strikes?|drones?|explosions?|shootdown|refiner\w*|refuel\w*|oil|diesel|crude|election|jury|trial|murder|death|film|movie|box office|episodes?|season|netflix|marvel|disney|messi|royal|lgbtq\+?|embassy|airport|flood\w*|fire|crash|burqa|eurovision|fertility|green card|moon|torture|knife|humanoid|cuba|power grid|border|f-15)\b/i;
 const HOOK_SOFT = /\b(trump|china|chinese|tariffs?|senate|apple|iphone|samsung|nvidia|openai|anthropic|meta|google|tesla|spacex|dell|jaguar|volkswagen|fed|fomc|cpi|gdp|inflation|yields?|bonds?|jobs|rate hikes?|rate cuts?|dollar|dxy|stocks?|treasury|wealth|billionaire|elon musk|bernie sanders|reddit|nepal)\b/i;
+const REACT = /\b(react|reaction|pressure|risk|watch|focus|alert|edge|jitters|mood)\b/i;
 const NO_CRYPTO_TITLE = /\b(no|not a?|without)\s+(any\s+)?(crypto|coin)\b|crypto news mix-?up|no coin prices|but no crypto/i;
 const NO_CRYPTO_LEAD = /\bno (direct )?(crypto|coin|token)[- ](angle|link|impact|connection|price|prices|move)\b/i;
 
@@ -120,14 +121,25 @@ function topicScore(row: Row, plain: string): { score: number; notes: string[]; 
   if (hardH) { s -= 3; notes.push(`non-crypto hook: ${t.match(HOOK_HARD)![0]}`); }
   else if (softH) { s -= 1; notes.push(`macro/news hook: ${t.match(HOOK_SOFT)![0]}`); }
 
-  if (NO_CRYPTO_TITLE.test(t) || NO_CRYPTO_LEAD.test(lead)) { s -= 4; notes.push('says it has no crypto impact'); }
+  if (NO_CRYPTO_TITLE.test(t) || (!strongT && NO_CRYPTO_LEAD.test(lead))) { s -= 4; notes.push('says it has no crypto impact'); }
 
   // the opening paragraph can only reinforce a title that already has a crypto signal
   if (strongT || genericT) s += STRONG.test(lead) ? 2 : GENERIC.test(lead) ? 1 : 0;
 
-  const off = s <= 0 || (!strongT && !genericT) || ((hardH || softH) && !strongT);
+  // "...as ETH, OP and ARB react / puts UNI and OP in focus": a coin ticker used only as a
+  // reaction hook, with no crypto subject, is the old pipeline's filler template
+  const tickerReaction = !strongT && TICKER.test(t) && REACT.test(t);
+  if (tickerReaction) notes.push('coin ticker used only as a reaction hook');
+  const off = s <= 0 || tickerReaction || (!strongT && !genericT) || ((hardH || softH) && !strongT);
   return { score: s, notes, off };
 }
+
+
+// Your curated posts use custom category names ("Trading", "Scam", "Safety", "Ethereum",
+// "Crypto Education"...). The old pipeline only ever wrote these four lowercase ones, so
+// anything else was categorised by a person and is protected from auto-delete and trimming.
+const PIPELINE_CATS = new Set(['news', 'guide', 'signal', 'airdrop', '']);
+const isProtected = (row: Row) => !PIPELINE_CATS.has(String(row.category ?? '').trim());
 
 // ───────────────────────── per-post analysis ─────────────────────────
 function analyse(row: Row): Omit<Result, 'verdict'> {
@@ -259,9 +271,9 @@ async function main() {
   const results: Result[] = base.map(r => {
     let v = verdictOf(r);
     // Guides are never auto-deleted (unless thin or truly leaked): a human decides.
-    if ((r.row.category ?? '') === 'guide' && v === 'DELETE' && !(r.words < 250 || (r as any).coreLeak)) {
+    if (isProtected(r.row) && v === 'DELETE' && !(r.words < 250 || (r as any).coreLeak)) {
       v = 'REWRITE';
-      r.issues.push('guide: protected from auto-delete, review manually');
+      r.issues.push('curated category: protected from auto-delete, review manually');
     }
     return { ...(r as Result), verdict: v };
   });
@@ -270,7 +282,7 @@ async function main() {
   const keepN = Number(opt('news-keep', '0'));
   if (keepN > 0) {
     const pool = results
-      .filter(r => r.verdict !== 'DELETE' && (r.row.category ?? 'news') === 'news')
+      .filter(r => r.verdict !== 'DELETE' && !isProtected(r.row))
       .sort((a, b) => a.score - b.score || (b.row.views ?? 0) - (a.row.views ?? 0) ||
         String(b.row.created_at).localeCompare(String(a.row.created_at)));
     for (const r of pool.slice(keepN)) {
